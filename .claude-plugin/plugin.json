@@ -1,0 +1,24 @@
+{
+  "name": "session-vault",
+  "displayName": "Session Vault",
+  "version": "1.0.0",
+  "description": "Lifetime retention and usage analytics for Claude Code. Keeps an append-only archive of every transcript, repairs corrupted JSONL without ever deleting good data, and maintains a queryable SQLite store plus continuously-refreshed CSV rollups of token usage.",
+  "author": {
+    "name": "Eduard Secureanu",
+    "email": "eduard.secureanu@gmail.com"
+  },
+  "repository": "https://github.com/eduard-secureanu/session-vault",
+  "license": "MIT",
+  "keywords": [
+    "usage",
+    "analytics",
+    "tokens",
+    "cost",
+    "backup",
+    "retention",
+    "archive",
+    "sqlite",
+    "ccusage"
+  ],
+  "hooks": "./hooks/hooks.json"
+}
