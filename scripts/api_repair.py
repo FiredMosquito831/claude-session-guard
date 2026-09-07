@@ -31,7 +31,7 @@ Whenever a line is dropped, any line whose `parentUuid` pointed at it is
 re-linked to the dropped line's own parent, so the conversation chain stays
 connected.
 
-SAFETY -- identical invariants to the rest of the vault:
+SAFETY -- identical invariants to the rest of Session Guard:
   * Nothing is ever deleted without first being copied, in full, to the
     permanent append-only archive; the rewrite is abandoned if that fails.
   * A full backup of the file is always taken first.

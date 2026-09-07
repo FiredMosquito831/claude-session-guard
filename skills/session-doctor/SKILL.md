@@ -1,9 +1,9 @@
 ---
-name: vault-doctor
-description: Diagnose Session Vault health — check that the transcript archive is in sync with live sessions, detect whether anything is deleting or truncating Claude Code session data, verify the usage database, and restore missing sessions from the archive. Use when the user suspects session data or usage/token history is being lost, pruned, or corrupted, when sessions have disappeared from the resume list, or when they ask whether their Claude Code data is safe.
+name: session-doctor
+description: Diagnose Claude Session Guard health — check that the transcript archive is in sync with live sessions, detect whether anything is deleting or truncating Claude Code session data, verify the usage database, and restore missing sessions from the archive. Use when the user suspects session data or usage/token history is being lost, pruned, or corrupted, when sessions have disappeared from the resume list, or when they ask whether their Claude Code data is safe.
 ---
 
-# Vault Doctor
+# Session Doctor
 
 Diagnoses whether Claude Code session data is being lost, and repairs it from
 the archive when it has been.
@@ -109,10 +109,11 @@ nested tree.
 
 ## 3b. Find a session in ANY folder
 
-Claude Code's resume picker is scoped to the current directory's project, and
-`--continue` is explicitly "the most recent conversation in the current
-directory". Sessions started elsewhere are invisible from where you are now.
-To search every session across every folder:
+Claude Code's `--resume` picker already spans every project on the machine, and
+`claude --resume <id>` works from any directory; only `--continue` is scoped to
+the current directory. Use `session_find` when you need what the picker does
+not give you — full-text search over every prompt, and the live/archived/gone
+status of a session:
 
     sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" session_find              # recent
     sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" session_find <text>       # search prompts
@@ -125,7 +126,8 @@ anywhere -- the prompts survive in history.jsonl but the conversation itself
 predates the archive and is gone.
 
 `claude --resume <session-id>` works from any directory, so once you have the
-id you do not need to cd anywhere.
+id you do not need to cd anywhere. A session marked `!` has no transcript left
+and cannot be resumed by any means -- only its prompts survive.
 
 ## 4. Check the analytics store
 
@@ -141,5 +143,5 @@ always safe and can never double-count.
 
 Lead with the verdict — is data being lost, yes or no — then the evidence.
 If you restored anything, say exactly how many sessions and lines came back.
-Do not describe the vault as "safe" on the strength of a `verify` you did not
+Do not describe Session Guard as "safe" on the strength of a `verify` you did not
 actually run.

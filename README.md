@@ -1,4 +1,4 @@
-# Session Vault
+# Claude Session Guard
 
 Lifetime retention and usage analytics for Claude Code.
 
@@ -7,7 +7,7 @@ Claude Code deletes session transcripts once they age past `cleanupPeriodDays`
 When that happens you lose the conversation *and* its token accounting, and
 nothing tells you it happened.
 
-Session Vault does three things:
+Claude Session Guard does three things:
 
 1. **Keeps everything.** An append-only mirror of every transcript that only
    ever grows — including subagent and workflow transcripts.
@@ -21,8 +21,8 @@ Session Vault does three things:
 ## Install
 
 ```bash
-/plugin marketplace add eduard-secureanu/session-vault
-/plugin install session-vault@session-vault
+/plugin marketplace add FiredMosquito831/claude-session-guard
+/plugin install claude-session-guard@claude-session-guard
 ```
 
 Then build the initial archive and database (one time, a few minutes on a large
@@ -62,7 +62,7 @@ Ask in plain language — the skills trigger on their own:
 
 - **usage-report** — "how many tokens did I use this week?", "which model is
   costing me the most?", "break down my usage by model this month"
-- **vault-doctor** — "is anything deleting my session data?", "my old sessions
+- **session-doctor** — "is anything deleting my session data?", "my old sessions
   disappeared", "restore my lost sessions"
 
 ## CLI
@@ -113,10 +113,12 @@ $R api_repair fix --all         # repair everything eligible
 
 ## Finding sessions across folders
 
-Claude Code's resume picker only shows sessions for the current directory's
-project. `session_find` lists every session from every folder, marks whether it
-is live / archived-only / gone, and prints the `claude --resume <id>` command
-(which works from any directory).
+Claude Code's own `--resume` picker already searches every project on the
+machine, and `claude --resume <id>` works from any directory. (`--continue` is
+the directory-scoped one.) `session_find` is for the things the picker does not
+do: full-text search across every prompt you have ever typed, and telling you
+whether a session is still **live**, only in the **archive**, or **gone**
+entirely — so you know whether a resume will work before you try.
 
 ```bash
 $R session_find                  # 20 most recent, all folders
@@ -188,9 +190,9 @@ report formats out of the box. Two deliberate differences here:
 
 - **Source.** ccusage reads `~/.claude/projects/` — the live directory. Anything
   the retention sweep deleted, or a rewrite truncated, is simply absent from its
-  reports. Session Vault reads its own archive, so its numbers only ever get
+  reports. Claude Session Guard reads its own archive, so its numbers only ever get
   more complete.
-- **Persistence.** ccusage recomputes on each run. Session Vault keeps a SQLite
+- **Persistence.** ccusage recomputes on each run. Claude Session Guard keeps a SQLite
   table, so you get arbitrary SQL over your whole history instantly and can
   define your own rollups instead of the ones a CLI chose.
 

@@ -8,7 +8,7 @@
 #
 # Exits 0 even when the tool fails: a retention/analytics hook must never block
 # or slow a session because of its own error. Problems surface in the tool's
-# own output and in `vault-doctor`.
+# own output and in `session-doctor`.
 
 set -u
 
@@ -18,7 +18,7 @@ TOOL="${1:-}"
 shift
 
 SCRIPT="$DIR/$TOOL.py"
-[ -f "$SCRIPT" ] || { echo "session-vault: no such tool: $TOOL" >&2; exit 0; }
+[ -f "$SCRIPT" ] || { echo "claude-session-guard: no such tool: $TOOL" >&2; exit 0; }
 
 PY=""
 for c in python3 python py; do
@@ -32,7 +32,7 @@ for c in python3 python py; do
 done
 
 if [ -z "$PY" ]; then
-    echo "session-vault: no Python 3 interpreter found; skipping $TOOL" >&2
+    echo "claude-session-guard: no Python 3 interpreter found; skipping $TOOL" >&2
     exit 0
 fi
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.0
+
+- Renamed to **claude-session-guard** (was session-vault); the `vault-doctor`
+  skill is now `session-doctor`.
+- Corrected a documentation error: Claude Code's `--resume` picker searches
+  every project on the machine, and `claude --resume <id>` works from any
+  directory. Only `--continue` is scoped to the current directory. Earlier docs
+  claimed the picker was directory-scoped, which overstated what `session_find`
+  is for -- its real value is full-text prompt search and live/archived/gone
+  status, not reaching sessions the picker cannot see.
+
 ## 1.3.0
 
 - **api_repair `from-hook`** — repair driven by the **SessionEnd** hook, which
@@ -59,4 +70,4 @@ Initial release.
   views, per-model breakdowns, session timelines, 5-hour billing blocks, and
   editable per-model pricing applied inside the views.
 - CSV rollups regenerated wholesale under a lock, written atomically.
-- Skills: `usage-report`, `vault-doctor`.
+- Skills: `usage-report`, `session-doctor`.

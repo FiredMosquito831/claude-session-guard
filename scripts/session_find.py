@@ -2,11 +2,12 @@
 """
 Session Find — browse and search EVERY Claude Code session, across all folders.
 
-Claude Code's own resume picker is scoped to the current directory's project,
-and `--continue` is explicitly "the most recent conversation in the current
-directory". So sessions you started in other folders are invisible unless you
-cd back to exactly the right place. This lists all of them, from anywhere, and
-prints the command to resume each one.
+Claude Code's own `--resume` picker already spans every project on the machine
+(only `--continue` is limited to the current directory), so this is not about
+reaching sessions the picker cannot see. It exists for what the picker does not
+offer: full-text search across every prompt you have ever typed, and an
+explicit live / archived-only / gone status per session, so you know whether a
+resume will actually work before you try it.
 
 It reads three sources and merges them, so a session shows up even if its live
 transcript has already been deleted by Claude Code's retention sweep:

@@ -1,11 +1,11 @@
 ---
 name: usage-report
-description: Report Claude Code token usage and cost from the Session Vault database — hourly, daily, weekly, or monthly, with an optional per-model breakdown, plus arbitrary SQL over the full history. Use when the user asks how many tokens they have used, what Claude Code is costing them, which model or project consumes the most, when they are most active, or asks for usage stats, a usage report, a breakdown by model, or a CSV export of their usage.
+description: Report Claude Code token usage and cost from the Claude Session Guard database — hourly, daily, weekly, or monthly, with an optional per-model breakdown, plus arbitrary SQL over the full history. Use when the user asks how many tokens they have used, what Claude Code is costing them, which model or project consumes the most, when they are most active, or asks for usage stats, a usage report, a breakdown by model, or a CSV export of their usage.
 ---
 
 # Usage Report
 
-Answers questions about Claude Code token usage from the Session Vault SQLite
+Answers questions about Claude Code token usage from the Claude Session Guard SQLite
 database, which holds one row per usage-bearing assistant message across the
 user's entire history.
 
@@ -29,7 +29,7 @@ sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" usage_db <command>
 | "when did each session run" | `sessions [N]` |
 | Anything else | `sql "SELECT ..."` |
 | "export to CSV" | `export` |
-| "find/list my sessions", "which session was X" | `session_find` (see vault-doctor) |
+| "find/list my sessions", "which session was X" | `session_find` (see session-doctor) |
 
 Run `sync` first only if the user suspects the data is stale — the Stop hook
 already refreshes it after every session.
