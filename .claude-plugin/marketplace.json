@@ -10,7 +10,7 @@
       "name": "session-vault",
       "displayName": "Session Vault",
       "description": "Lifetime retention and usage analytics for Claude Code: append-only transcript archive, non-destructive JSONL repair, and a queryable SQLite store with continuously-refreshed hourly/daily/weekly/monthly CSV rollups.",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "source": "./",
       "license": "MIT",
       "keywords": [

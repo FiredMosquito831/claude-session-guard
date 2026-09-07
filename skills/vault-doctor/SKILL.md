@@ -58,6 +58,31 @@ lines verbatim, skips live and recently-written files, writes atomically,
 aborts if a file changes mid-scan, and archives every removed line before
 rewriting. If you find a *different* repair tool, that is the suspect.
 
+## 2b. "Each thinking block must contain non-whitespace thinking"
+
+If a resume fails with:
+
+    API Error: 400 messages.N.content.0.thinking:
+    each thinking block must contain non-whitespace thinking
+
+that is a DIFFERENT fault from anything `jsonl_repair` handles. The line is
+valid JSON; it is the Messages API that rejects it. Claude Code writes one
+assistant response as several transcript lines sharing a `message.id` and
+merges them on replay, so an empty thinking block on any of those lines poisons
+the whole conversation.
+
+    sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" api_repair scan
+    sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" api_repair fix <session-id>
+    sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" api_repair fix --all
+
+`scan` never writes. `fix` drops only the empty block -- or the whole line when
+the block is all the line holds -- re-links `parentUuid` so the chain stays
+connected, and archives everything it removes first. Token accounting is
+unaffected: the sibling lines of the same message carry the same `usage`.
+
+A live session is refused (recent mtime, or a matching `CLAUDE_SESSION_ID`).
+Close the session before repairing it.
+
 ## 3. Restore what was lost
 
 ```

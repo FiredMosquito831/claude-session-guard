@@ -127,7 +127,30 @@ CREATE TABLE IF NOT EXISTS ingest_state (
     ingested_at TEXT
 );
 
--- Cost per event: longest matching pricing pattern wins; unpriced models = 0.
+-- CRITICAL: Claude Code splits one assistant API response across several
+-- transcript lines -- one content block per line (thinking, then text, then
+-- each tool_use) -- and repeats the SAME `usage` object on every one of them.
+-- Summing per line therefore double-counts massively (measured: +50.7% on a
+-- real corpus). Every rollup must aggregate over LOGICAL MESSAGES, not lines.
+--
+-- Dedup key is (session_id, message_id). Within a message the usage object
+-- grows as the response streams, so we keep the row with the largest token
+-- total -- the final, complete one -- not an arbitrary row.
+CREATE VIEW IF NOT EXISTS v_events_dedup AS
+SELECT uuid, session_id, request_id, message_id, ts_iso, ts_epoch, date, month,
+       hour, model, project, git_branch, cc_version, is_sidechain, service_tier,
+       speed, effort, stop_reason, input_tokens, output_tokens,
+       cache_creation_tokens, cache_read_tokens, ephemeral_5m_tokens,
+       ephemeral_1h_tokens, total_tokens, cost_usd, source_file
+FROM (
+    SELECT *, ROW_NUMBER() OVER (
+               PARTITION BY session_id, message_id
+               ORDER BY total_tokens DESC, ts_epoch DESC, uuid) AS _rn
+    FROM usage_events
+)
+WHERE _rn = 1;
+
+-- Cost per message: longest matching pricing pattern wins; unpriced models = 0.
 CREATE VIEW IF NOT EXISTS v_events_costed AS
 SELECT e.*,
        COALESCE((
@@ -142,7 +165,7 @@ SELECT e.*,
          WHERE e.model LIKE p.model_pattern || '%'
          ORDER BY LENGTH(p.model_pattern) DESC LIMIT 1
        ), 0.0) AS calc_cost_usd
-FROM usage_events e;
+FROM v_events_dedup e;
 
 CREATE VIEW IF NOT EXISTS v_daily AS
 SELECT date,
@@ -227,7 +250,7 @@ SELECT strftime('%Y-%m-%d %H:00', ts_iso) AS hour_bucket,
        SUM(cache_read_tokens) AS cache_read_tokens,
        SUM(total_tokens) AS total_tokens,
        ROUND(SUM(calc_cost_usd), 4) AS cost_usd
-FROM v_events_costed WHERE ts_iso <> ''
+FROM v_events_costed
 GROUP BY hour_bucket ORDER BY hour_bucket;
 
 CREATE VIEW IF NOT EXISTS v_hourly_ts_by_model AS
@@ -239,7 +262,7 @@ SELECT strftime('%Y-%m-%d %H:00', ts_iso) AS hour_bucket, model,
        SUM(cache_read_tokens) AS cache_read_tokens,
        SUM(total_tokens) AS total_tokens,
        ROUND(SUM(calc_cost_usd), 4) AS cost_usd
-FROM v_events_costed WHERE ts_iso <> ''
+FROM v_events_costed
 GROUP BY hour_bucket, model ORDER BY hour_bucket, total_tokens DESC;
 
 CREATE VIEW IF NOT EXISTS v_weekly AS
@@ -253,7 +276,7 @@ SELECT strftime('%Y-W%W', date) AS week,
        SUM(cache_read_tokens) AS cache_read_tokens,
        SUM(total_tokens) AS total_tokens,
        ROUND(SUM(calc_cost_usd), 4) AS cost_usd
-FROM v_events_costed WHERE date <> ''
+FROM v_events_costed
 GROUP BY week ORDER BY week;
 
 CREATE VIEW IF NOT EXISTS v_weekly_by_model AS
@@ -265,7 +288,7 @@ SELECT strftime('%Y-W%W', date) AS week, model,
        SUM(cache_read_tokens) AS cache_read_tokens,
        SUM(total_tokens) AS total_tokens,
        ROUND(SUM(calc_cost_usd), 4) AS cost_usd
-FROM v_events_costed WHERE date <> ''
+FROM v_events_costed
 GROUP BY week, model ORDER BY week, total_tokens DESC;
 
 CREATE VIEW IF NOT EXISTS v_monthly_by_model AS
@@ -277,7 +300,7 @@ SELECT month, model,
        SUM(cache_read_tokens) AS cache_read_tokens,
        SUM(total_tokens) AS total_tokens,
        ROUND(SUM(calc_cost_usd), 4) AS cost_usd
-FROM v_events_costed WHERE month <> ''
+FROM v_events_costed
 GROUP BY month, model ORDER BY month, total_tokens DESC;
 
 -- Session lifecycle: when each session opened and closed, and what it cost.
@@ -600,15 +623,19 @@ def cmd_export(reports_dir: Path | None = None) -> int:
 
 def cmd_stats() -> int:
     conn = connect()
+    # Must read the DEDUPED view: usage_events holds one row per transcript
+    # LINE, and one API message is split across several lines that each repeat
+    # the same usage object. Summing the raw table overstates by ~50%.
     q = conn.execute("""
         SELECT COUNT(*), COUNT(DISTINCT session_id), COUNT(DISTINCT model),
                COUNT(DISTINCT date), MIN(date), MAX(date),
                SUM(input_tokens), SUM(output_tokens),
                SUM(cache_creation_tokens), SUM(cache_read_tokens),
                SUM(total_tokens)
-        FROM usage_events""").fetchone()
+        FROM v_events_dedup""").fetchone()
     cost = conn.execute("SELECT ROUND(SUM(calc_cost_usd),2) FROM v_events_costed").fetchone()[0]
-    labels = ["events", "sessions", "models", "active days", "first day", "last day",
+    raw = conn.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0]
+    labels = ["messages", "sessions", "models", "active days", "first day", "last day",
               "input tokens", "output tokens", "cache-creation tokens",
               "cache-read tokens", "TOTAL tokens"]
     for label, val in zip(labels, q):
@@ -617,6 +644,8 @@ def cmd_stats() -> int:
         else:
             print(f"  {label:24} {str(val):>18}")
     print(f"  {'est. cost (priced only)':24} {('$' + format(cost or 0, ',.2f')):>18}")
+    print(f"  {'(transcript lines)':24} {raw:>18,}   <- lines, not messages; "
+          f"one message spans several")
     conn.close()
     return 0
 

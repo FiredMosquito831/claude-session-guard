@@ -18,6 +18,15 @@
             "timeout": 60
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" api_repair fix --all",
+            "timeout": 180
+          }
+        ]
       }
     ],
     "Stop": [
@@ -74,6 +83,15 @@
             "type": "command",
             "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" jsonl_repair --all",
             "timeout": 120
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" api_repair fix --all",
+            "timeout": 180
           }
         ]
       }

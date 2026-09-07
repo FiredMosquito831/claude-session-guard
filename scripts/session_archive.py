@@ -229,12 +229,56 @@ def cmd_sync(full: bool = False) -> int:
     return 0
 
 
+def deliberately_removed_keys() -> set:
+    """Line identities that a repair tool removed ON PURPOSE.
+
+    `api_repair` deletes lines that are valid JSON but that the Messages API
+    rejects (an assistant line whose only content is an empty thinking block).
+    Those lines stay in the archive forever, so without this the "live files
+    missing archived lines" alarm would fire for every repaired session and the
+    detector would become useless noise. Every deliberate removal is recorded
+    in the permanent archive, so we can subtract exactly those and keep the
+    alarm meaningful for genuine, unexplained loss.
+    """
+    keys = set()
+    archive = CLAUDE_DIR / "backups" / "sessions" / "removed-lines-archive.jsonl"
+    if not archive.exists():
+        return keys
+    try:
+        with open(archive, "r", encoding="utf-8", errors="surrogateescape") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                content = rec.get("content")
+                if not isinstance(content, str):
+                    continue
+                # Do NOT restrict this to JSON-looking content: jsonl_repair
+                # also removes control-character-only padding lines, and those
+                # are just as deliberate. Excusing only JSON left them to fire
+                # the alarm forever. Key both the raw and stripped forms, since
+                # the archiver stores the stripped line.
+                keys.add(line_key(content))
+                stripped = content.strip()
+                if stripped != content:
+                    keys.add(line_key(stripped))
+    except Exception:
+        pass
+    return keys
+
+
 def cmd_verify() -> int:
     live_index = {str(r): p for r, p in iter_live_transcripts()}
     archived = [q for q in TRANSCRIPTS_DIR.rglob("*.jsonl")] if TRANSCRIPTS_DIR.exists() else []
+    excused = deliberately_removed_keys()
 
     only_archived = []
     shrunk = []
+    excused_total = 0
     for arch in archived:
         rel = arch.relative_to(TRANSCRIPTS_DIR)
         live = live_index.get(str(rel))
@@ -244,6 +288,10 @@ def cmd_verify() -> int:
         a_keys = {line_key(ln) for ln in read_lines(arch)}
         l_keys = {line_key(ln) for ln in read_lines(live)}
         missing = a_keys - l_keys
+        if missing and excused:
+            before = len(missing)
+            missing = missing - excused
+            excused_total += before - len(missing)
         if missing:
             shrunk.append((str(rel), len(missing)))
 
@@ -254,9 +302,15 @@ def cmd_verify() -> int:
         print(f"    {p.relative_to(TRANSCRIPTS_DIR)}")
     if len(only_archived) > 20:
         print(f"    ... and {len(only_archived) - 20} more")
-    print(f"[session-archive] live files missing archived lines: {len(shrunk)}")
+    print(f"[session-archive] live files missing archived lines: {len(shrunk)}"
+          "   <-- the canary: anything above 0 is unexplained data loss")
     for name, n in shrunk[:20]:
         print(f"    {name}: {n} lines only in archive")
+    if len(shrunk) > 20:
+        print(f"    ... and {len(shrunk) - 20} more")
+    if excused_total:
+        print(f"[session-archive] ({excused_total} further missing lines were removed "
+              "deliberately by a repair tool and are archived, so not counted above)")
     return 0
 
 

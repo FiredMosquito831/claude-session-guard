@@ -11,8 +11,9 @@ Session Vault does three things:
 
 1. **Keeps everything.** An append-only mirror of every transcript that only
    ever grows — including subagent and workflow transcripts.
-2. **Repairs without destroying.** A JSONL repair pass that fixes genuinely
-   broken lines and is structurally incapable of deleting good ones.
+2. **Repairs without destroying.** Two repair passes — one for malformed JSONL,
+   one for transcripts the API rejects on resume — both structurally incapable
+   of deleting good data.
 3. **Makes usage queryable.** A SQLite store of every token-usage event, plus
    continuously-refreshed CSV rollups — hourly, daily, weekly, monthly, each
    with a per-model breakdown.
@@ -84,26 +85,64 @@ $R session_archive restore   # put lost sessions back
 $R jsonl_repair --all --dry-run
 ```
 
+## Resuming old sessions
+
+Claude Code writes one assistant response as several transcript lines that
+share a `message.id`, and merges them back on replay. If any of those lines
+holds a thinking block whose text is empty or whitespace, resuming the session
+dies with:
+
+    API Error: 400 messages.N.content.0.thinking:
+    each thinking block must contain non-whitespace thinking
+
+`api_repair` fixes exactly this, and runs on SessionStart so it is already
+clean by the time you resume. It removes only the empty block (or the line, if
+that is all the line holds), re-links the `parentUuid` chain, and archives
+whatever it removes. Nothing else is touched.
+
+```bash
+$R api_repair scan              # report only, never writes
+$R api_repair fix <session-id>  # repair one session
+$R api_repair fix --all         # repair everything eligible
+```
+
 ## Why the numbers are trustworthy
 
-Every usage event is one row keyed by its message `uuid`, which is the table's
-primary key. Re-scanning a transcript upserts the same row, so **an event can
-never be counted twice** no matter how often ingest runs. Every rollup and CSV
-is a plain `GROUP BY` regenerated wholesale from that one table — never
+Two separate de-duplications are needed, and both are enforced:
+
+1. **Per line.** Each transcript line is one row keyed by its `uuid`, the
+   table's primary key, so re-scanning a transcript upserts rather than
+   appends — ingest can run any number of times without inflating anything.
+2. **Per message.** Claude Code splits one assistant API response across
+   several lines (thinking, then text, then each tool_use) and repeats the
+   *same* `usage` object on every one of them. Summing lines therefore
+   over-counts badly — measured at **+50.7%** on a real corpus. Every rollup
+   reads `v_events_dedup`, which keeps one row per `(session_id, message_id)`,
+   choosing the row with the largest token total because the usage object grows
+   as the response streams.
+
+Miss the second and your totals are roughly 1.5x reality. Every rollup and CSV
+is a plain `GROUP BY` over the deduplicated view, regenerated wholesale — never
 appended to — so periods cannot overlap or drift apart.
 
 That is checkable, not just claimed:
 
 ```
-events table          85,192,489,088   <-- reference
-v_hourly_ts           85,192,489,088   delta +0
-v_daily               85,192,489,088   delta +0
-v_weekly              85,192,489,088   delta +0
-v_monthly             85,192,489,088   delta +0
-v_by_model            85,192,489,088   delta +0
-v_blocks_5h           85,192,489,088   delta +0
-697,072 rows = 697,072 distinct uuids
+v_events_dedup (ref)     45,038,824,445   delta +0
+v_hourly_ts              45,038,824,445   delta +0
+v_daily                  45,038,824,445   delta +0
+v_weekly                 45,038,824,445   delta +0
+v_monthly                45,038,824,445   delta +0
+v_by_model               45,038,824,445   delta +0
+v_blocks_5h              45,038,824,445   delta +0
+v_sessions_timeline      45,038,824,445   delta +0
+
+729,912 transcript lines  ->  339,927 logical messages
+naive per-line total: 91,341,052,299  (2.03x the truth)
 ```
+
+No period view filters rows out, so nothing can be silently dropped from a
+rollup — every one reconciles to the same grand total.
 
 CSVs are written to a temp file and atomically renamed, under a lock, so a
 reader never sees a half-written file and two hook fires cannot interleave.

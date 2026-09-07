@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.1.0
+
+- **api_repair** (new) — repairs transcripts that are valid JSON but that the
+  Messages API rejects on resume: an assistant line whose only content is an
+  empty/whitespace thinking block, which makes `claude --resume` fail with
+  "each thinking block must contain non-whitespace thinking". Drops only the
+  empty block (or the line, when that is all it holds), re-links the
+  `parentUuid` chain, archives everything it removes, and refuses to touch a
+  live session. Wired to SessionStart and PreCompact.
+- **usage_db** — FIXED a significant over-count. Claude Code splits one
+  assistant response across several transcript lines and repeats the same
+  `usage` object on each, so summing lines inflated every total by ~2x. All
+  rollups now read `v_events_dedup`, one row per `(session_id, message_id)`,
+  keeping the most complete row. Period views no longer filter any rows, so
+  every rollup reconciles exactly.
+- **session_archive verify** — the "live files missing archived lines" alarm
+  now excuses lines a repair tool removed deliberately (they stay in the
+  archive by design), so the canary keeps meaning something.
+
 ## 1.0.0
 
 Initial release.
