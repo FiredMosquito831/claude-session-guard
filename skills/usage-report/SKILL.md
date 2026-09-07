@@ -29,6 +29,7 @@ sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" usage_db <command>
 | "when did each session run" | `sessions [N]` |
 | Anything else | `sql "SELECT ..."` |
 | "export to CSV" | `export` |
+| "find/list my sessions", "which session was X" | `session_find` (see vault-doctor) |
 
 Run `sync` first only if the user suspects the data is stale — the Stop hook
 already refreshes it after every session.

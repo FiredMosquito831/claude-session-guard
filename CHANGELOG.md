@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.0
+
+- **session_find** (new) — browse and search every session across every folder.
+  Claude Code's resume picker is scoped to the current directory's project, so
+  sessions started elsewhere are otherwise invisible. Merges history.jsonl, the
+  live transcripts and the archive; marks each session live / archived-only /
+  gone; prints the `claude --resume <id>` command (which works from any
+  directory). Forces UTF-8 output so Unicode in prompts cannot crash the
+  listing on a cp1252 Windows console.
+
 ## 1.1.0
 
 - **api_repair** (new) — repairs transcripts that are valid JSON but that the

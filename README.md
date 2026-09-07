@@ -80,6 +80,8 @@ $R usage_db sessions 40      # session timeline
 $R usage_db export           # regenerate every CSV
 $R usage_db sql "SELECT ..." # arbitrary read-only SQL
 
+$R session_find              # browse/search sessions across ALL folders
+$R session_find docker       # search prompts everywhere
 $R session_archive verify    # is anything eating session data?
 $R session_archive restore   # put lost sessions back
 $R jsonl_repair --all --dry-run
@@ -104,6 +106,20 @@ whatever it removes. Nothing else is touched.
 $R api_repair scan              # report only, never writes
 $R api_repair fix <session-id>  # repair one session
 $R api_repair fix --all         # repair everything eligible
+```
+
+## Finding sessions across folders
+
+Claude Code's resume picker only shows sessions for the current directory's
+project. `session_find` lists every session from every folder, marks whether it
+is live / archived-only / gone, and prints the `claude --resume <id>` command
+(which works from any directory).
+
+```bash
+$R session_find                  # 20 most recent, all folders
+$R session_find "auth bug"       # search prompt text everywhere
+$R session_find --project Beam   # restrict to a project
+$R session_find --all            # everything
 ```
 
 ## Why the numbers are trustworthy

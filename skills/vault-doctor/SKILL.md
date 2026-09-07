@@ -107,6 +107,26 @@ names rather than assuming; a hand-written character-class regex that tries to
 list the separators is a common way to get this wrong and silently create a
 nested tree.
 
+## 3b. Find a session in ANY folder
+
+Claude Code's resume picker is scoped to the current directory's project, and
+`--continue` is explicitly "the most recent conversation in the current
+directory". Sessions started elsewhere are invisible from where you are now.
+To search every session across every folder:
+
+    sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" session_find              # recent
+    sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" session_find <text>       # search prompts
+    sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" session_find --project X  # one project
+    sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" session_find --all
+
+Each entry is marked `*` live (resume right now, the command is printed),
+`~` archived only (run `session_archive restore` first), or `!` no transcript
+anywhere -- the prompts survive in history.jsonl but the conversation itself
+predates the archive and is gone.
+
+`claude --resume <session-id>` works from any directory, so once you have the
+id you do not need to cd anywhere.
+
 ## 4. Check the analytics store
 
 ```
