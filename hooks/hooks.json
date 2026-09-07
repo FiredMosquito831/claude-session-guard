@@ -95,6 +95,17 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" api_repair from-hook",
+            "timeout": 60
+          }
+        ]
+      }
     ]
   }
 }

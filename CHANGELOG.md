@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.0
+
+- **api_repair `from-hook`** — repair driven by the **SessionEnd** hook, which
+  passes `transcript_path` on stdin. That is the one moment a transcript is
+  provably finished, so no timestamp heuristic is needed and a session is clean
+  the instant it closes. Skips `end_reason: resume` (that transcript is about
+  to be reopened). The TOCTOU guard still applies.
+- **Process-based liveness** — the sweep now also excludes sessions named by a
+  running `claude` process, rather than relying on file age alone.
+- Liveness guards no longer apply to `scan`, which never writes.
+
 ## 1.2.0
 
 - **session_find** (new) — browse and search every session across every folder.

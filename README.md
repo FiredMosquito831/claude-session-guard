@@ -97,8 +97,11 @@ dies with:
     API Error: 400 messages.N.content.0.thinking:
     each thinking block must contain non-whitespace thinking
 
-`api_repair` fixes exactly this, and runs on SessionStart so it is already
-clean by the time you resume. It removes only the empty block (or the line, if
+`api_repair` fixes exactly this. It runs at **SessionEnd**, repairing the
+transcript at the one moment it is provably not being written to — so a session
+is clean the instant it closes, and there is no window in which resuming it
+fails. A SessionStart sweep catches anything missed (a crash, a session that
+predates the plugin). It removes only the empty block (or the line, if
 that is all the line holds), re-links the `parentUuid` chain, and archives
 whatever it removes. Nothing else is touched.
 

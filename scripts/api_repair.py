@@ -44,6 +44,9 @@ SAFETY -- identical invariants to the rest of the vault:
 
 Commands:
     scan                 report what is broken; never writes (default)
+    from-hook            repair the transcript named on stdin by a SessionEnd
+                         hook payload -- the safest moment, since the session
+                         has just terminated
     fix --all            repair every eligible transcript
     fix <session-id>     repair one session by id (allowed even if recent,
                          since you are asking for it explicitly -- but never
@@ -207,6 +210,12 @@ def repair_file(path: Path, dry_run: bool = True, force: bool = False) -> dict:
     # touched looks "recent".
     if dry_run:
         pass
+    elif force == "session_end":
+        # SessionEnd fired for this exact transcript: the session has
+        # terminated, so "recently written" is expected and is NOT evidence of
+        # liveness. The TOCTOU check below still protects us -- if anything
+        # appends between the read and the write, the rewrite is abandoned.
+        pass
     elif not force:
         active = os.environ.get("CLAUDE_SESSION_ID", "").strip()
         if active and path.stem == active:
@@ -277,6 +286,75 @@ def repair_file(path: Path, dry_run: bool = True, force: bool = False) -> dict:
     return stats
 
 
+def running_session_ids() -> set:
+    """Session ids of Claude Code processes running right now.
+
+    A far better liveness signal than a timestamp, when it is available. Not
+    every process names its session on the command line (`claude -r` does not),
+    so this narrows the guess rather than replacing the mtime fallback.
+    """
+    ids = set()
+    try:
+        import subprocess
+        if os.name == "nt":
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_Process -Filter \"Name='claude.exe'\" "
+                 "| ForEach-Object { $_.CommandLine }"],
+                capture_output=True, text=True, timeout=20).stdout
+        else:
+            out = subprocess.run(["ps", "-eo", "args"],
+                                 capture_output=True, text=True, timeout=20).stdout
+    except Exception:
+        return ids
+    import re as _re
+    for m in _re.finditer(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                          r"[0-9a-f]{4}-[0-9a-f]{12}", out or ""):
+        ids.add(m.group(0))
+    return ids
+
+
+def cmd_from_hook() -> int:
+    """Repair exactly the transcript named by a SessionEnd hook payload.
+
+    This is the safe moment: the session has ended, so the file is no longer
+    being appended to, and we do not have to guess from a timestamp. It closes
+    the window in which a just-closed session is still broken and a resume
+    would fail.
+    """
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        return 0
+    if not isinstance(data, dict):
+        return 0
+
+    # end_reason "resume" means this transcript is about to be reopened by the
+    # resuming process -- exactly the case where rewriting is unsafe.
+    if str(data.get("end_reason", "")).lower() == "resume":
+        return 0
+
+    tp = data.get("transcript_path") or ""
+    path = Path(tp) if tp else None
+    if path is None or not path.is_file():
+        sid = data.get("session_id") or ""
+        hits = resolve_target(sid) if sid else []
+        if not hits:
+            return 0
+        path = hits[0]
+
+    r = repair_file(path, dry_run=False, force="session_end")
+    if r.get("blocks_removed") or r.get("lines_removed"):
+        print(f"[api-repair] {path.name}: removed "
+              f"{r.get('lines_removed',0)} empty-thinking lines, "
+              f"{r.get('blocks_removed',0)} blocks; relinked {r.get('relinked',0)}")
+        log([r], dry_run=False)
+    elif r.get("aborted"):
+        print(f"[api-repair] {path.name}: ABORTED ({r['aborted']})")
+        log([r], dry_run=False)
+    return 0
+
+
 def iter_transcripts():
     if not PROJECTS_DIR.exists():
         return
@@ -337,6 +415,9 @@ def main() -> int:
     rest = [a for a in args[1:] if not a.startswith("-")]
     dry_run = mode != "fix"
 
+    if mode == "from-hook":
+        return cmd_from_hook()
+
     if mode not in ("scan", "fix"):
         print(__doc__)
         return 1
@@ -356,7 +437,10 @@ def main() -> int:
             targets.extend(hits)
         force = True          # explicit target = explicit consent
     else:
-        targets = list(iter_transcripts())
+        # Sweep: additionally exclude any session a running Claude Code process
+        # names on its command line, so we do not depend on mtime alone.
+        live_ids = running_session_ids() if not dry_run else set()
+        targets = [t for t in iter_transcripts() if t.stem not in live_ids]
         force = False
 
     results = []
