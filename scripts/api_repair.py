@@ -201,7 +201,13 @@ def repair_file(path: Path, dry_run: bool = True, force: bool = False) -> dict:
     except OSError as e:
         return {"file": str(path), "error": f"stat failed: {e}"}
 
-    if not force:
+    # Liveness guards exist to prevent a WRITE from truncating a file Claude
+    # Code is appending to. A scan never writes, so applying them there just
+    # blinds the report -- notably right after a repair, when every file it
+    # touched looks "recent".
+    if dry_run:
+        pass
+    elif not force:
         active = os.environ.get("CLAUDE_SESSION_ID", "").strip()
         if active and path.stem == active:
             return {"file": str(path), "skipped": "active session"}
