@@ -13,6 +13,7 @@ import random
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 # Set SESSION_GUARD_HOME before any plugin code is imported, so nothing touches real data.
@@ -351,9 +352,135 @@ def test_lock_busy_skips():
     assert arch.read_bytes() == before, "the archive changed while another process held the lock"
 
 
+def make_shrunken(rng, age_seconds, extra_lines=0):
+    """The archive holds 20 lines. The live file keeps the first 10, plus extra_lines new lines that are
+    not archived, and its mtime is set age_seconds into the past. Returns (live, rel, archive, live bytes)."""
+    live, rel, arch, state = paths()
+    live.parent.mkdir(parents=True, exist_ok=True)
+    full = chunk(rng, 20)
+    live.write_bytes(full)
+    sa.sync_transcript(live, rel)
+    archive_bytes = arch.read_bytes()
+    extra = [make_line(rng, True).rstrip(b"\n") for _ in range(extra_lines)]
+    live_bytes = b"".join(ln + b"\n" for ln in complete_lines(full)[:10] + extra)
+    live.write_bytes(live_bytes)
+    t = time.time() - age_seconds
+    os.utime(live, (t, t))
+    return live, rel, archive_bytes, live_bytes
+
+
+def quarantine_copies(rel, kind):
+    qdir = sa.QUARANTINE_DIR / Path(rel).parent
+    if not qdir.exists():
+        return []
+    return [q for q in qdir.iterdir() if q.name.startswith(Path(rel).name) and q.name.endswith("." + kind)]
+
+
+def restore_quiet(merge_live, running=lambda: set()):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = sa.cmd_restore(merge_live=merge_live, running_ids=running)
+    assert rc == 0, buf.getvalue()
+    return buf.getvalue()
+
+
+def test_restore_without_flag_never_modifies_live():
+    reset()
+    live, rel, archive_bytes, live_bytes = make_shrunken(random.Random(21), age_seconds=7200)
+    before = os.stat(live)
+    out = restore_quiet(merge_live=False)
+    after = os.stat(live)
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns), "size or mtime changed"
+    assert live.read_bytes() == live_bytes, "live bytes changed"
+    assert "shrunken, not touched" in out, out
+    assert quarantine_copies(rel, "before-restore") == [], "a quarantine copy was made without the flag"
+
+
+def test_restore_with_flag_merges_file_quiet_for_an_hour():
+    reset()
+    live, rel, archive_bytes, live_bytes = make_shrunken(random.Random(22), age_seconds=7200, extra_lines=1)
+    extra_line = live_bytes.split(b"\n")[-2]
+    out = restore_quiet(merge_live=True)
+    merged = live.read_bytes()
+    assert merged == archive_bytes + extra_line + b"\n", "merged bytes are not archive bytes plus the live-only line"
+    assert b"\r" not in merged, "a carriage return was produced"
+    copies = quarantine_copies(rel, "before-restore")
+    assert len(copies) == 1, f"expected one quarantine copy, found {len(copies)}"
+    assert copies[0].read_bytes() == live_bytes, "quarantine copy differs from the live file before restore"
+    assert "merged 10 lines back into" in out, out
+
+
+def test_restore_with_flag_leaves_recent_file_alone():
+    reset()
+    live, rel, archive_bytes, live_bytes = make_shrunken(random.Random(23), age_seconds=300, extra_lines=1)
+    before = os.stat(live)
+    out = restore_quiet(merge_live=True)
+    after = os.stat(live)
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns), "a recent file was changed"
+    assert live.read_bytes() == live_bytes, "a recent file's bytes changed"
+    assert quarantine_copies(rel, "before-restore") == [], "a quarantine copy was made for a recent file"
+    assert "modified in the last hour, not touched" in out, out
+
+
+def test_restore_skips_running_session():
+    reset()
+    live, rel, archive_bytes, live_bytes = make_shrunken(random.Random(24), age_seconds=7200)
+    out_running = restore_quiet(merge_live=True, running=lambda: {"sess-1"})
+    assert "session is running, not touched" in out_running, out_running
+    out_unknown = restore_quiet(merge_live=True, running=lambda: None)
+    assert "could not read the process list, not touched" in out_unknown, out_unknown
+    assert live.read_bytes() == live_bytes, "a running or unknown session was touched"
+    assert quarantine_copies(rel, "before-restore") == [], "a quarantine copy was made"
+
+
+def test_restore_new_file_is_byte_identical():
+    reset()
+    live, rel, arch, state = paths()
+    live.parent.mkdir(parents=True, exist_ok=True)
+    live.write_bytes(chunk(random.Random(25), 15))
+    sa.sync_transcript(live, rel)
+    archive_bytes = arch.read_bytes()
+    live.unlink()                                       # an archive-only session
+    restore_quiet(merge_live=False)                     # creating a missing file needs no flag
+    assert live.exists(), "the missing live file was not created"
+    assert live.read_bytes() == archive_bytes, "restored file is not byte-identical to the archive copy"
+
+
+def test_restore_writes_no_crlf():
+    reset()
+    live, rel, arch, state = paths()
+    arch.parent.mkdir(parents=True, exist_ok=True)
+    crlf_line = b'{"type":"assistant","uuid":"old-crlf-1"}\r\n'
+    lf_line = b'{"type":"assistant","uuid":"new-lf-1"}\n'
+    archive_bytes = crlf_line + lf_line
+    arch.write_bytes(archive_bytes)
+    restore_quiet(merge_live=False)                     # archive-only: created byte for byte
+    assert live.read_bytes() == archive_bytes, "new file differs from the archive copy"
+    live.write_bytes(lf_line)                           # shrunken: the CRLF line is missing
+    t = time.time() - 7200
+    os.utime(live, (t, t))
+    restore_quiet(merge_live=True)
+    merged = live.read_bytes()
+    assert merged == archive_bytes, "merged file differs from the archive copy"
+    assert merged.count(b"\r\n") == crlf_line.count(b"\r\n") == 1, "CR bytes were added or lost"
+
+
+def test_running_ids_parser():
+    a = "ABCDEF01-2345-4678-9abc-def012345678"
+    b = "11111111-2222-4333-8444-555555555555"
+    text = (f"C:\\Program Files\\claude\\claude.exe --resume {a}\n"
+            f"notepad.exe {b}\n"
+            "python -I session_archive_v2.py restore\n")
+    ids = sa._running_ids_from_text(text)
+    assert ids == {a.lower()}, ids
+
+
 TESTS = [test_fast_path_equals_full_merge, test_no_line_lost_after_rewrite, test_archive_is_never_rewritten,
          test_crash_between_append_and_state, test_binary_and_complete_lines, test_counting_fast_path_reads,
-         test_status_rename, test_sync_transcript_mode, test_lock_busy_skips]
+         test_status_rename, test_sync_transcript_mode, test_lock_busy_skips,
+         test_restore_without_flag_never_modifies_live, test_restore_with_flag_merges_file_quiet_for_an_hour,
+         test_restore_with_flag_leaves_recent_file_alone, test_restore_skips_running_session,
+         test_restore_new_file_is_byte_identical, test_restore_writes_no_crlf, test_running_ids_parser]
 
 
 def main():

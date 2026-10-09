@@ -3,15 +3,38 @@
 Session Archive v2 -- append-only mirror of Claude Code transcripts. Stdlib only.
 
 A new file beside session_archive.py. The live tool is unchanged. This version
-never rewrites an archive file, reads only the bytes a sync needs, and writes
-in binary. Usage rows are not handled here (PR-06).
+does not rewrite archive files (see Invariants), reads only the bytes a sync needs,
+and writes in binary. Usage rows are not handled here (PR-06).
 
 Under SESSION_GUARD_HOME/session-archive/ (default ~/.claude/session-archive/):
 
-  transcripts/<rel>                 the archive of one transcript. It only grows.
-  state/<rel>.json                  live_offset, head_sha, tail_sha, archive_size.
-  quarantine/<rel>.<stamp>.partial  archive bytes a crash left beyond the recorded
-                                    size. Copied here and fsynced before the cut.
+  transcripts/<rel>                        the archive of one transcript. It only grows.
+  state/<rel>.json                         live_offset, head_sha, tail_sha, archive_size.
+  quarantine/<rel>.<stamp>.partial         archive bytes beyond the recorded size (crash path).
+  quarantine/<rel>.<stamp>.before-restore  a live file's bytes before restore --merge-live.
+
+Invariants:
+  1. The archive never loses a line. A line cut by the crash path is in quarantine.
+  2. The archive file is never rewritten. It only grows, by appends. The one exception
+     is the crash path below.
+  3. Every write is binary, and every append ends on a complete line.
+  4. If the state does not match what was recorded, sync falls back to a line-identity
+     full merge. That merge also only appends, except for the crash-path cut.
+
+Crash path: archive bytes beyond the recorded archive_size are copied to quarantine,
+fsynced, and only then cut. This never removes recorded content; it removes only bytes
+that were never recorded as archived, after copying them to quarantine.
+
+Restore: every write is binary and goes through a temporary file, fsync and os.replace.
+  - An archive-only session is created with its archive bytes, byte for byte. The target
+    must not exist.
+  - A live file that is missing archived lines is reported as "shrunken, not touched"
+    unless --merge-live is given.
+  - With --merge-live, a file is skipped if it was modified in the last hour, if its
+    session id is on a running claude command line, or if the process list cannot be
+    read. Otherwise its current bytes are copied to quarantine (before-restore), and the
+    file is replaced by the archive bytes followed by the live lines that are not in the
+    archive, raw.
 
 The state says how many live bytes are safely archived (live_offset), the
 checksums of the first and last 4 KB of that prefix, and the archive size right
@@ -34,7 +57,10 @@ Commands:
 import hashlib
 import json
 import os
+import re
+import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -95,15 +121,15 @@ def _save_state(path: Path, live_offset: int, head: bytes, tail: bytes, archive_
     })
 
 
-def _quarantine(rel: str, tail: bytes) -> Path:
-    """Copy bytes that are about to leave the archive into quarantine, and fsync. Never overwrites."""
+def _quarantine(rel: str, data: bytes, kind: str = "partial") -> Path:
+    """Copy bytes into quarantine under <rel>.<stamp>.<kind>, and fsync. Never overwrites."""
     rp = Path(rel)
     qdir = QUARANTINE_DIR / rp.parent
     qdir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    qpath = qdir / f"{rp.name}.{stamp}.partial"
+    qpath = qdir / f"{rp.name}.{stamp}.{kind}"
     with open(qpath, "xb") as f:
-        f.write(tail)
+        f.write(data)
         f.flush()
         os.fsync(f.fileno())
     return qpath
@@ -270,17 +296,6 @@ def _read_text_lines(path: Path) -> list:
         return []
 
 
-def _write_text_lines(path: Path, lines: list) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8", errors="surrogateescape") as f:
-        for ln in lines:
-            f.write(ln + "\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-
-
 def iter_live_transcripts():
     """(relative_path, absolute_path) for every transcript under projects/, subagents included."""
     if not PROJECTS_DIR.exists():
@@ -362,36 +377,139 @@ def cmd_verify() -> int:
     return 0
 
 
-def cmd_restore() -> int:
-    live_index = {str(r): p for r, p in iter_live_transcripts()}
-    archived = [q for q in TRANSCRIPTS_DIR.rglob("*.jsonl")] if TRANSCRIPTS_DIR.exists() else []
-    restored = merged = 0
+RESTORE_QUIET_SECONDS = 3600    # restore leaves a live file alone if it changed more recently than this
+UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
-    for arch in archived:
-        rel = arch.relative_to(TRANSCRIPTS_DIR)
-        live = live_index.get(str(rel))
-        arch_lines = _read_text_lines(arch)
-        if not arch_lines:
-            continue
-        if live is None:
-            target = PROJECTS_DIR / rel
-            if target.exists():
-                continue
-            _write_text_lines(target, arch_lines)
-            restored += 1
-            continue
-        live_lines = _read_text_lines(live)
-        have = {_text_key(ln) for ln in live_lines}
-        missing = [ln for ln in arch_lines if _text_key(ln) not in have]
-        if missing:
-            _write_text_lines(live, arch_lines + [ln for ln in live_lines
-                                                  if _text_key(ln) not in
-                                                  {_text_key(x) for x in arch_lines}])
-            merged += 1
 
-    print(f"[session-archive] restored {restored} missing sessions, "
-          f"merged lines back into {merged} shrunken transcripts")
-    return 0
+def _running_ids_from_text(text: str) -> set:
+    """Lower-case session ids found on the lines of a process list that mention claude."""
+    ids = set()
+    for line in text.splitlines():
+        if "claude" in line.lower():
+            ids.update(m.group(0).lower() for m in UUID_RE.finditer(line))
+    return ids
+
+
+def running_session_ids():
+    """Session ids on the command line of a running claude process. None when the process
+    list cannot be read, and restore then touches nothing."""
+    if os.name == "nt":
+        cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+               "Get-CimInstance Win32_Process | ForEach-Object { $_.CommandLine }"]
+    else:
+        cmd = ["ps", "-eww", "-o", "args="]
+    try:
+        out = subprocess.run(cmd, capture_output=True, timeout=60, check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return _running_ids_from_text(out.decode("utf-8", "replace"))
+
+
+class _Lazy:
+    """Calls fn at most once, the first time its value is needed."""
+
+    def __init__(self, fn):
+        self._fn, self._done, self._value = fn, False, None
+
+    def __call__(self):
+        if not self._done:
+            self._value, self._done = self._fn(), True
+        return self._value
+
+
+def _session_of(rel: str) -> str:
+    """Owning session id (lower case) of a transcript, by its path under projects/."""
+    parts = rel.split("/")
+    if len(parts) >= 3 and "subagents" in parts:
+        return parts[1].lower()
+    return Path(parts[-1]).stem.lower()
+
+
+def _complete_lines(data: bytes) -> list:
+    """The complete lines of data, without their newlines. A trailing partial line is left out."""
+    end = data.rfind(b"\n") + 1
+    return data[:end - 1].split(b"\n") if end else []
+
+
+def _merge_one(rel: str, arch_bytes: bytes, live: Path, merge_live: bool, running: _Lazy) -> str:
+    live_bytes = live.read_bytes()
+    st = os.stat(live)
+    arch_lines = _complete_lines(arch_bytes)
+    live_lo = live_bytes.rfind(b"\n") + 1
+    live_lines = _complete_lines(live_bytes[:live_lo])
+    live_tail = live_bytes[live_lo:]
+    live_keys = {line_key(ln) for ln in live_lines}
+    arch_keys = {line_key(ln) for ln in arch_lines}
+    missing = [ln for ln in arch_lines if line_key(ln) not in live_keys]
+    if not missing:
+        return "none"
+    if arch_bytes[-1:] != b"\n":
+        print(f"[session-archive] archive ends in an incomplete line, not restored: {rel}")
+        return "skipped"
+    if not merge_live:
+        print(f"[session-archive] shrunken, not touched: {rel} ({len(missing)} lines only in archive)")
+        return "untouched"
+    if time.time() - st.st_mtime < RESTORE_QUIET_SECONDS:
+        print(f"[session-archive] modified in the last hour, not touched: {rel}")
+        return "skipped"
+    ids = running()
+    if ids is None:
+        print(f"[session-archive] could not read the process list, not touched: {rel}")
+        return "skipped"
+    if _session_of(rel) in ids:
+        print(f"[session-archive] session is running, not touched: {rel}")
+        return "skipped"
+    extra = [ln for ln in live_lines if line_key(ln) not in arch_keys]
+    merged = arch_bytes + b"".join(ln + b"\n" for ln in extra) + live_tail
+    now = os.stat(live)
+    if (now.st_size, now.st_mtime_ns) != (st.st_size, st.st_mtime_ns):
+        print(f"[session-archive] changed while restoring, not touched: {rel}")
+        return "skipped"
+    _quarantine(rel, live_bytes, "before-restore")
+    guardkit.write_bytes_atomic(live, merged)
+    print(f"[session-archive] merged {len(missing)} lines back into {rel}; copy kept in quarantine")
+    return "merged"
+
+
+def _restore_one(rel: str, merge_live: bool, running: _Lazy) -> str:
+    """Restore one archived transcript. Returns restored, merged, untouched, skipped or none."""
+    arch = TRANSCRIPTS_DIR / rel
+    live = PROJECTS_DIR / rel
+    lock = guardkit.lock_wait("session-archive-" + rel.replace("/", "__"), timeout=LOCK_TIMEOUT)
+    if lock is None:
+        print(f"[session-archive] skipped {rel}: lock busy, retried on the next restore")
+        return "skipped"
+    try:
+        arch_bytes = arch.read_bytes()
+        if not arch_bytes:
+            return "none"
+        if not os.path.lexists(live):
+            guardkit.write_bytes_atomic(live, arch_bytes)   # byte for byte; the target did not exist
+            return "restored"
+        return _merge_one(rel, arch_bytes, live, merge_live, running)
+    finally:
+        lock.release()
+
+
+def cmd_restore(merge_live: bool = False, running_ids=running_session_ids) -> int:
+    """Create archive-only sessions. With merge_live, also merge missing lines into shrunken live files."""
+    running = _Lazy(running_ids)
+    counts = {"restored": 0, "merged": 0, "untouched": 0, "skipped": 0, "none": 0}
+    errors = 0
+    if TRANSCRIPTS_DIR.exists():
+        for arch in sorted(TRANSCRIPTS_DIR.rglob("*.jsonl")):
+            rel = arch.relative_to(TRANSCRIPTS_DIR).as_posix()
+            try:
+                counts[_restore_one(rel, merge_live, running)] += 1
+            except Exception as exc:                # one bad file must not stop the restore
+                errors += 1
+                print(f"[session-archive] error on {rel}: {exc!r}")
+    print(f"[session-archive] restored {counts['restored']} missing sessions, "
+          f"merged lines back into {counts['merged']} shrunken transcripts")
+    if counts["untouched"]:
+        print(f"[session-archive] {counts['untouched']} shrunken transcripts not touched "
+              "(run restore --merge-live to merge them)")
+    return 1 if errors else 0
 
 
 def cmd_status() -> int:
@@ -435,11 +553,11 @@ def main() -> int:
         return cmd_sync_transcript(args[2])
     if mode == "verify":
         return cmd_verify()
-    if mode == "restore":
-        return cmd_restore()
+    if mode == "restore" and args[1:] in ([], ["--merge-live"]):
+        return cmd_restore(merge_live=args[1:] == ["--merge-live"])
     if mode == "status":
         return cmd_status()
-    print(f"Usage: {sys.argv[0]} [sync [--all | --transcript <path>]|verify|restore|status]")
+    print(f"Usage: {sys.argv[0]} [sync [--all | --transcript <path>]|verify|restore [--merge-live]|status]")
     return 1
 
 
