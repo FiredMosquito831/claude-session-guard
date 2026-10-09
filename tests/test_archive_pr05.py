@@ -26,7 +26,7 @@ import session_archive_v2 as sa  # noqa: E402
 
 assert str(gk.CLAUDE_DIR).startswith(HOME), "test would touch real data"
 assert str(sa.CLAUDE_DIR).startswith(HOME), "test would touch real data"
-SLUG = "C--Users-fgghk-pr05-test"
+SLUG = "C--work-pr05-test"
 
 
 def reset():
