@@ -398,6 +398,29 @@ def t8_resume_is_skipped():
           (log.strip().splitlines() or ["no log"])[-1])
 
 
+# ---- T8b: the documented SessionEnd field `reason` is read the same way as end_reason ----
+def t8b_reason_resume_is_skipped():
+    fresh_env("t8b")
+    path = new.PROJECTS_DIR / "P" / "reopen.jsonl"
+    raw = dirty_raw("t8b")
+    write_old(path, raw)
+    real_payload = gk.read_hook_payload
+    gk.read_hook_payload = lambda: {"reason": "resume", "transcript_path": str(path)}
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = new.cmd_from_hook()
+    finally:
+        gk.read_hook_payload = real_payload
+    log_file = gk.LOG_DIR / "api_repair.log"
+    log = log_file.read_text(encoding="utf-8") if log_file.exists() else ""
+    check("T8b reason: the hook returns 0", rc == 0, f"rc={rc}")
+    check("T8b reason: the transcript is unchanged and nothing is archived",
+          path.read_bytes() == raw and not archived_for(path))
+    check("T8b reason: the hook log says the transcript is about to be reopened",
+          "end_reason=resume" in log and "about to be reopened" in log,
+          (log.strip().splitlines() or ["no log"])[-1])
+
+
 # ---- T10: the index sees records written by another writer, and rebuilds after a truncation ----
 def t10_index_refresh_and_rebuild():
     fresh_env("t10")
@@ -482,7 +505,7 @@ def t12_index_across_blocks():
 
 ALL = [t2_invalid_utf8, t9_archive_format, t3_aborted_run_archives_nothing, t4_second_run_is_idempotent,
        t5_session_end_guard, t6_real_transcripts, t7_relink_timing, t8_resume_is_skipped,
-       t10_index_refresh_and_rebuild, t11_sweep_saves_cache_on_stop, t12_index_across_blocks]
+       t8b_reason_resume_is_skipped, t10_index_refresh_and_rebuild, t11_sweep_saves_cache_on_stop, t12_index_across_blocks]
 
 for fn in ALL:
     try:

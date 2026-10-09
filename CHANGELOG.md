@@ -13,6 +13,7 @@ These changes are in the repository and tested. The hooks in `hooks/hooks.json` 
 - `scripts/guard_hook.py`: one dispatcher per hook event, with per-step deadlines and detached repair sweeps.
 - `scripts/run.sh`: caches the interpreter path, so a hook call starts Python once on a cache hit.
 - `tools/deploy.py`: copies an allowlist of scripts to a target folder. Dry run by default; runs the tests first.
+- `scripts/guard_hook.py` and `scripts/api_repair_v2.py`: the SessionEnd repair reads the documented `reason` field, skips `resume`, and falls back to `end_reason`. The live v1 tool (`scripts/api_repair.py`) still reads `end_reason` until it is replaced.
 
 Known limits: a rewrite confined to the middle of an indexed prefix is not detected; the 2026-10-07 and 2026-10-09 usage totals are not reconciled; prices are unverified; the skills (`usage-report`, `session-doctor`) describe the 1.4.0 tools until the v2 tools are wired.
 
