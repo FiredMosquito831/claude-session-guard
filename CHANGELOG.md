@@ -1,8 +1,8 @@
 # Changelog
 
-## 1.4.2 (staged tools; not wired into hooks yet)
+## 1.4.2 (2026-10-10; staged tools, not wired into hooks yet)
 
-Version 1.4.2 is the first release of the v2 tools. Its hooks still run the 1.4.0 tools until a later, separate step. Nothing on a user's machine changes until that step.
+Version 1.4.2 is the first release of the v2 tools. Its hooks still run the 1.4.0 tools until a later, separate step. The hooks on a user's machine do not change until that step. The install command changed with the rename; see the Changed entry.
 
 These changes are in the repository and tested. The hooks in `hooks/hooks.json` still run the 1.4.0 scripts. The new modules are wired only after a separate, approved change to the settings.
 
