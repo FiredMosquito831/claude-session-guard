@@ -226,6 +226,91 @@ def test_run_pool_isolation():
     assert len(errors) == 2 and len(clean) == 8, f"{len(errors)} errors, {len(clean)} clean"
 
 
+def test_clean_cache_detects_new_size():
+    d = scratch("cc-size")
+    f = d / "a.jsonl"
+    f.write_bytes(b"x" * 20)
+    st = os.stat(f)
+    cache = gk.CleanCache("test-cc-size")
+    cache.mark("p/a.jsonl", st.st_size, st.st_mtime_ns)
+    assert cache.is_clean("p/a.jsonl", st.st_size, st.st_mtime_ns), "a fresh mark is not clean"
+    f.write_bytes(b"y" * 25)
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))              # keep the old mtime: only the size differs
+    st2 = os.stat(f)
+    assert st2.st_size == 25, f"size is {st2.st_size}, expected 25"
+    assert st2.st_mtime_ns == st.st_mtime_ns, "the mtime restore did not take"
+    assert not cache.is_clean("p/a.jsonl", st2.st_size, st2.st_mtime_ns), \
+        "a file with a new size was reported clean"
+
+
+def test_clean_cache_detects_new_mtime_same_size():
+    d = scratch("cc-mtime")
+    f = d / "b.jsonl"
+    f.write_bytes(b"a" * 20)
+    st = os.stat(f)
+    cache = gk.CleanCache("test-cc-mtime")
+    cache.mark("p/b.jsonl", st.st_size, st.st_mtime_ns)
+    assert cache.is_clean("p/b.jsonl", st.st_size, st.st_mtime_ns), "a fresh mark is not clean"
+    f.write_bytes(b"b" * 20)                                          # same size, different content
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
+    st2 = os.stat(f)
+    assert st2.st_size == st.st_size, "the rewrite changed the size"
+    assert not cache.is_clean("p/b.jsonl", st2.st_size, st2.st_mtime_ns), \
+        "a file with a new mtime was reported clean"
+
+
+def test_clean_cache_persists_across_instances():
+    d = scratch("cc-persist")
+    f = d / "c.jsonl"
+    f.write_bytes(b"c" * 12)
+    st = os.stat(f)
+    name = "test-cc-persist"
+    cache = gk.CleanCache(name)
+    cache.mark("p/c.jsonl", st.st_size, st.st_mtime_ns)
+    cache.close()
+    assert cache.path.exists(), "close() did not write the state file"
+    again = gk.CleanCache(name)
+    assert again.is_clean("p/c.jsonl", st.st_size, st.st_mtime_ns), \
+        "the entry did not survive a new CleanCache with the same name"
+
+
+def test_known_limit_restored_mtime_same_size_is_reported_clean():
+    """Accepted limit (QUEUE K2, review RD12). The key is metadata. If this test fails, the key changed: read RD12 before you update this test."""
+    d = scratch("cc-limit")
+    f = d / "d.jsonl"
+    f.write_bytes(b"d" * 16)
+    st = os.stat(f)
+    cache = gk.CleanCache("test-cc-limit")
+    cache.mark("p/d.jsonl", st.st_size, st.st_mtime_ns)
+    assert cache.is_clean("p/d.jsonl", st.st_size, st.st_mtime_ns), "a fresh mark is not clean"
+    f.write_bytes(b"e" * 16)                                          # same size, different content
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))                  # restore the old atime and mtime
+    st2 = os.stat(f)
+    assert st2.st_size == st.st_size and st2.st_mtime_ns == st.st_mtime_ns, \
+        f"restore did not match: size {st2.st_size}, mtime {st2.st_mtime_ns} vs {st.st_mtime_ns}"
+    assert cache.is_clean("p/d.jsonl", st2.st_size, st2.st_mtime_ns), \
+        "the accepted limit changed: a restored mtime with the same size is no longer reported clean"
+
+
+def test_os_replace_repair_is_rechecked():
+    d = scratch("cc-replace")
+    f = d / "r.jsonl"
+    f.write_bytes(b"r" * 18)
+    st = os.stat(f)
+    cache = gk.CleanCache("test-cc-replace")
+    cache.mark("p/r.jsonl", st.st_size, st.st_mtime_ns)
+    assert cache.is_clean("p/r.jsonl", st.st_size, st.st_mtime_ns), "a fresh mark is not clean"
+    tmp = d / "r.jsonl.tmp"
+    tmp.write_bytes(b"s" * 18)                                        # the repaired copy, same size
+    os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    os.replace(tmp, f)
+    st2 = os.stat(f)
+    assert st2.st_size == st.st_size, "the repair changed the size"
+    assert st2.st_mtime_ns != st.st_mtime_ns, "os.replace left the old mtime in place"
+    assert not cache.is_clean("p/r.jsonl", st2.st_size, st2.st_mtime_ns), \
+        "a repaired file was reported clean from the old entry"
+
+
 TESTS = [
     test_lock_mutual_exclusion,
     test_stale_lock_is_taken_over,
@@ -237,6 +322,11 @@ TESTS = [
     test_cleancache_checkpoints,
     test_cleancache_round_trip_and_prune,
     test_run_pool_isolation,
+    test_clean_cache_detects_new_size,
+    test_clean_cache_detects_new_mtime_same_size,
+    test_clean_cache_persists_across_instances,
+    test_known_limit_restored_mtime_same_size_is_reported_clean,
+    test_os_replace_repair_is_rechecked,
 ]
 
 

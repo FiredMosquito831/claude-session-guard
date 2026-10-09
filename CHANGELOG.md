@@ -13,8 +13,20 @@ These changes are in the repository and tested. The hooks in `hooks/hooks.json` 
 - `scripts/guard_hook.py`: one dispatcher per hook event, with per-step deadlines and detached repair sweeps.
 - `scripts/run.sh`: caches the interpreter path, so a hook call starts Python once on a cache hit.
 - `tools/deploy.py`: copies an allowlist of scripts to a target folder. Dry run by default; runs the tests first.
+- `scripts/guard_hook.py` and `scripts/api_repair_v2.py`: the SessionEnd repair reads the documented `reason` field, skips `resume`, and falls back to `end_reason`. The live v1 tool (`scripts/api_repair.py`) still reads `end_reason` until it is replaced.
 
 Known limits: a rewrite confined to the middle of an indexed prefix is not detected; the 2026-10-07 and 2026-10-09 usage totals are not reconciled; prices are unverified; the skills (`usage-report`, `session-doctor`) describe the 1.4.0 tools until the v2 tools are wired.
+
+### Changed
+
+- Plugin renamed to `session-guard`. The name `claude-session-guard` is reserved by Claude Code plugin validation, and `claude plugin validate . --strict` failed on it. Install with `/plugin install session-guard@claude-session-guard`. Manifests set to 1.4.2 in this batch.
+
+### Tests and tools
+
+- `tools/deploy.py`: each `--apply` writes a manifest of the deployed hashes, beside the backup root. A read-only `--check` compares the repo copies with a target folder and exits 1 when any copy differs or is missing.
+- `tests/test_api_v2.py`: exits 1 when any check fails, so the deploy gate can see a failure. Its real-transcript check reads only transcripts older than one hour and strips one trailing CR from each line before it compares the two outputs. A new check confirms that untouched CRLF lines keep their CR.
+- `tests/test_guardkit.py`: pins the accepted limit that a same-size rewrite with a restored mtime is reported clean (QUEUE K2).
+- `tests/test_guard_hook_e2e_pr18.py`: an end-to-end test that runs `scripts/guard_hook.py` as a child process for each documented hook payload and reads back the results.
 
 ## 1.4.0
 

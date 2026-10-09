@@ -211,6 +211,73 @@ def test_session_end_passes_reason():
     assert "from-hook end_reason=resume" in log and "skipped" in log, "end_reason was not passed through"
 
 
+def test_session_end_reason_resume_skips():
+    reset_home()
+    sid = "20000000-0000-4000-8000-000000000001"
+    t = make_transcript(f"slugR1/{sid}.jsonl", [jline(6), thinking_line()])
+    before = t.read_bytes()
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = guard_hook.main(["SessionEnd"], payload={"session_id": sid, "transcript_path": str(t),
+                                                       "cwd": "unused", "reason": "resume"})
+    line = out.getvalue()
+    assert rc == 0, f"exit code {rc}"
+    assert line.startswith("[guard] SessionEnd: repair=ok "), line
+    assert t.read_bytes() == before, "the transcript was changed although the session resumes (reason)"
+    log = (Path(guardkit.LOG_DIR) / "api_repair.log").read_text(encoding="utf-8")
+    assert "from-hook end_reason=resume" in log and "skipped" in log, "reason was not read by from-hook"
+
+
+def test_session_end_reason_clear_repairs():
+    reset_home()
+    sid = "20000000-0000-4000-8000-000000000002"
+    t = make_transcript(f"slugR2/{sid}.jsonl", [jline(6), thinking_line()])
+    before = t.read_bytes()
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = guard_hook.main(["SessionEnd"], payload={"session_id": sid, "transcript_path": str(t),
+                                                       "cwd": "unused", "reason": "clear"})
+    line = out.getvalue()
+    assert rc == 0, f"exit code {rc}"
+    assert line.startswith("[guard] SessionEnd: repair=ok "), line
+    assert t.read_bytes() != before, "the transcript was not repaired although the session ended (clear)"
+
+
+def test_session_end_reason_wins_over_end_reason():
+    reset_home()
+    sid = "20000000-0000-4000-8000-000000000003"
+    t = make_transcript(f"slugR3/{sid}.jsonl", [jline(6), thinking_line()])
+    before = t.read_bytes()
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = guard_hook.main(["SessionEnd"], payload={"session_id": sid, "transcript_path": str(t),
+                                                       "cwd": "unused", "reason": "clear",
+                                                       "end_reason": "resume"})
+    line = out.getvalue()
+    assert rc == 0, f"exit code {rc}"
+    assert line.startswith("[guard] SessionEnd: repair=ok "), line
+    assert t.read_bytes() != before, "reason=clear did not win over end_reason=resume"
+    log = (Path(guardkit.LOG_DIR) / "api_repair.log").read_text(encoding="utf-8")
+    assert "from-hook end_reason=clear" in log, "reason did not take precedence over end_reason"
+
+
+def test_session_end_end_reason_fallback():
+    reset_home()
+    sid = "20000000-0000-4000-8000-000000000004"
+    t = make_transcript(f"slugR4/{sid}.jsonl", [jline(6), thinking_line()])
+    before = t.read_bytes()
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = guard_hook.main(["SessionEnd"], payload={"session_id": sid, "transcript_path": str(t),
+                                                       "cwd": "unused", "end_reason": "resume"})
+    line = out.getvalue()
+    assert rc == 0, f"exit code {rc}"
+    assert line.startswith("[guard] SessionEnd: repair=ok "), line
+    assert t.read_bytes() == before, "the transcript was changed; end_reason alone must still skip"
+    log = (Path(guardkit.LOG_DIR) / "api_repair.log").read_text(encoding="utf-8")
+    assert "from-hook end_reason=resume" in log and "skipped" in log, "end_reason fallback was not read"
+
+
 def test_no_double_launch():
     reset_home()
     lock = guardkit.FileLock("api_repair-sweep")
@@ -256,6 +323,8 @@ def test_summary_line_format():
 
 TESTS = [test_usage_line, test_session_start_order_and_detach, test_stop_scoped_to_transcript,
          test_step_failure_is_isolated, test_timeout_is_recorded, test_session_end_passes_reason,
+         test_session_end_reason_resume_skips, test_session_end_reason_clear_repairs,
+         test_session_end_reason_wins_over_end_reason, test_session_end_end_reason_fallback,
          test_no_double_launch, test_summary_line_format]
 
 
