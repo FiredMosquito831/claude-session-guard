@@ -13,12 +13,15 @@ This module decides nothing about what is repaired or archived. It provides:
   * CleanCache               "verified clean at this size and mtime" memory
   * read_hook_payload        the JSON Claude Code writes to a hook's stdin
   * session_transcripts      a session's transcript plus its subagent transcripts
+  * append_removed_records   the one locked, binary writer for the removed-lines archive (PR-09)
 """
+import hashlib
 import json
 import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 
 CLAUDE_DIR = Path(os.environ.get("SESSION_GUARD_HOME") or (Path.home() / ".claude"))
@@ -330,3 +333,166 @@ def session_transcripts(transcript: Path) -> list:
     if sub.is_dir():
         files.extend(p for p in sub.rglob("*.jsonl") if p.is_file() and "acompact" not in str(p))
     return files
+
+
+# --- The removed-lines archive (PR-09, F19) ---------------------------------
+# One writer for backups/sessions/removed-lines-archive.jsonl, shared by api_repair_v2 and
+# jsonl_repair_v2. It takes the archive lock, writes each whole record in binary with O_APPEND,
+# and keeps a digest index in STATE_DIR, so a record already archived is never archived again.
+
+REMOVED_LINES_ARCHIVE = CLAUDE_DIR / "backups" / "sessions" / "removed-lines-archive.jsonl"
+REMOVED_LOCK_NAME = "removed-lines-archive"
+INDEX_READ_BLOCK = 8 * 1024 * 1024       # the archive is streamed in blocks this size (about 2 GB real)
+
+
+def _removed_index_paths() -> tuple:
+    """The digest index of the removed-lines archive, kept in the state folder."""
+    return STATE_DIR / "removed_index.json", STATE_DIR / "removed_index.bin"
+
+
+def _record_digest(source_file: str, content: str) -> bytes:
+    """16-byte identity of one archived record: its source file and its exact content."""
+    key = source_file.encode("utf-8", "surrogateescape") + b"\0" + content.encode("utf-8", "surrogateescape")
+    return hashlib.blake2b(key, digest_size=16).digest()
+
+
+def _refresh_removed_index(archive: Path, read_block: int) -> set:
+    """Index the archive records written since the last refresh, and return every known digest.
+
+    Call with the archive lock held. Only complete lines are read. The new digests are appended to
+    removed_index.bin and synced before the offset is recorded in removed_index.json. If the archive
+    is smaller than the recorded offset, it was truncated or replaced, so the index is rebuilt.
+    """
+    idx_json, idx_bin = _removed_index_paths()
+    state = load_json(idx_json, None)
+    offset = state.get("archive_offset") if isinstance(state, dict) else None
+    try:
+        archive_size = archive.stat().st_size
+    except FileNotFoundError:
+        archive_size = 0
+    rebuild = not isinstance(offset, int) or offset < 0 or archive_size < offset
+    if rebuild:
+        if isinstance(offset, int) and offset > archive_size:
+            msg = (f"removed-lines archive is smaller than its index ({archive_size} < {offset} bytes); "
+                   "index rebuilt from the start")
+            print("[guardkit] warning: " + msg, file=sys.stderr)
+            log_line("removed_archive", "warning: " + msg)
+        offset = 0
+    new, bad, consumed = [], 0, offset      # consumed: archive offset through the last complete line
+    try:
+        f = open(archive, "rb")
+    except FileNotFoundError:
+        f = None
+    if f is not None:
+        with f:
+            f.seek(offset)
+            carry = b""
+            while True:
+                block = f.read(read_block)
+                if not block:
+                    break
+                buf = carry + block
+                cut = buf.rfind(b"\n") + 1
+                if cut == 0:
+                    carry = buf
+                    continue
+                for raw_line in buf[:cut].split(b"\n"):
+                    if not raw_line.strip():
+                        continue
+                    try:
+                        rec = json.loads(raw_line.decode("utf-8", "surrogateescape"))
+                    except ValueError:
+                        bad += 1
+                        continue
+                    if not isinstance(rec, dict) or not isinstance(rec.get("source_file"), str) \
+                            or not isinstance(rec.get("content"), str):
+                        bad += 1
+                        continue
+                    new.append(_record_digest(rec["source_file"], rec["content"]))
+                consumed += cut
+                carry = buf[cut:]
+    if bad:
+        log_line("removed_archive", f"removed-lines archive: {bad} unreadable record(s) skipped while indexing")
+    idx_bin.parent.mkdir(parents=True, exist_ok=True)
+    with open(idx_bin, "a+b") as f:
+        size = f.seek(0, os.SEEK_END)
+        keep = 0 if rebuild else size // 16 * 16  # drop a partial digest left by a killed write
+        if keep != size:
+            f.truncate(keep)
+        if new:
+            f.write(b"".join(new))
+        f.flush()
+        os.fsync(f.fileno())
+        f.seek(0)
+        data = f.read()
+    atomic_write_json(idx_json, {"archive_offset": consumed})
+    return {data[i:i + 16] for i in range(0, len(data) // 16 * 16, 16)}
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    """Write every byte of data to fd. A whole record is one os.write call in the normal case."""
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        if n <= 0:
+            raise OSError("removed-lines archive: write made no progress")
+        view = view[n:]
+
+
+def append_removed_records(records: list, *, archive: Path | None = None,
+                           read_block: int | None = None) -> tuple:
+    """Archive each removed record once, under the archive lock. Returns (written, skipped).
+
+    records: dicts with source_file (str), source_line (int), reason (str) and content (str). The
+    content may hold surrogates from surrogateescape decoding; those bytes are written back exactly.
+    A record is known when its digest (source file and content) is already in the archive, or was
+    written earlier in this call. Known records are skipped and counted.
+
+    The lock is held from the index refresh to the last write. Each record is one binary write with
+    O_APPEND, so records from concurrent processes never share a line. Raises RuntimeError when the
+    lock cannot be taken within 60 s, and OSError when a write fails. Either way the caller must
+    leave the transcript untouched.
+
+    archive and read_block default to REMOVED_LINES_ARCHIVE and INDEX_READ_BLOCK. api_repair_v2
+    passes its own, so tests that set them on that module still apply.
+    """
+    archive = REMOVED_LINES_ARCHIVE if archive is None else Path(archive)
+    read_block = INDEX_READ_BLOCK if read_block is None else read_block
+    lock = lock_wait(REMOVED_LOCK_NAME, timeout=60)
+    if lock is None:
+        raise RuntimeError("the removed-lines archive is locked by another process")
+    try:
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().isoformat()
+        known = _refresh_removed_index(archive, read_block)
+        written = skipped = 0
+        new_digests, offset = [], None
+        # O_BINARY stops the C runtime from turning each LF into CRLF on Windows.
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0)
+        fd = os.open(str(archive), flags, 0o644)
+        try:
+            for rec in records:
+                digest = _record_digest(rec["source_file"], rec["content"])
+                if digest in known:
+                    skipped += 1
+                    continue
+                out = {"archived_at": stamp, "source_file": rec["source_file"],
+                       "source_line": rec["source_line"], "reason": rec["reason"], "content": rec["content"]}
+                _write_all(fd, json.dumps(out, ensure_ascii=False).encode("utf-8", "surrogateescape") + b"\n")
+                offset = os.fstat(fd).st_size     # right after our own last write, never a later stat
+                known.add(digest)
+                new_digests.append(digest)
+                written += 1
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if new_digests:
+            idx_json, idx_bin = _removed_index_paths()
+            with open(idx_bin, "ab") as f:
+                f.write(b"".join(new_digests))
+                f.flush()
+                os.fsync(f.fileno())
+            atomic_write_json(idx_json, {"archive_offset": offset})
+        return written, skipped
+    finally:
+        lock.release()
