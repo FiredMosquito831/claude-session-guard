@@ -22,7 +22,7 @@ Claude Session Guard does three things:
 
 ```bash
 /plugin marketplace add FiredMosquito831/claude-session-guard
-/plugin install claude-session-guard@claude-session-guard
+/plugin install session-guard@claude-session-guard
 ```
 
 Then build the initial archive and database (one time, a few minutes on a large

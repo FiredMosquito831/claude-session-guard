@@ -6,10 +6,10 @@
   },
   "plugins": [
     {
-      "name": "claude-session-guard",
+      "name": "session-guard",
       "displayName": "Claude Session Guard",
       "description": "Keeps Claude Code sessions persistent, self-repairing and always resumable: append-only transcript archive, automatic repair of the corruption that breaks --resume, and queryable token-usage analytics.",
-      "version": "1.4.0",
+      "version": "1.4.1",
       "source": "./",
       "license": "MIT",
       "keywords": [
