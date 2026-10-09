@@ -90,22 +90,76 @@ cases = {
 for name, raw in cases.items():
     check("equivalence: " + name, both(raw, str(abs(hash(name)))))
 
-# Real transcripts: random sample, compared with the previous implementation.
+def strip_cr(b):  # same body as tests/test_repair_pr03.py:113-115
+    return b[:-1] if b.endswith(b"\r") else b
+
+def touched_flags(raw):
+    """One flag per raw line: True when v2 drops or rewrites it, False when it copies it byte for byte."""
+    lines = raw.split(b"\n")
+    parsed = []
+    for ln in lines:
+        try:
+            o = json.loads(ln.decode("utf-8", "surrogateescape").strip())
+        except ValueError:
+            o = None
+        parsed.append(o if isinstance(o, dict) else None)
+
+    def blocks(o):
+        m = o.get("message") if o else None
+        c = m.get("content") if isinstance(m, dict) else None
+        return c if isinstance(c, list) else None
+
+    dropped_uuids = set()
+    for o in parsed:
+        c = blocks(o)
+        if c and all(new.is_empty_thinking(b) for b in c) and o.get("uuid"):
+            dropped_uuids.add(o["uuid"])
+    flags = []
+    for o in parsed:
+        if o is None:
+            flags.append(False)
+            continue
+        c = blocks(o)
+        has_empty = bool(c) and any(new.is_empty_thinking(b) for b in c)
+        relinked = isinstance(o.get("parentUuid"), str) and o["parentUuid"] in dropped_uuids
+        flags.append(bool(has_empty or relinked))
+    return lines, flags
+
+# Real transcripts: a random sample of files older than one hour (the product's active-file rule),
+# compared with the previous implementation. Sorted first, so one population gives one sample.
 random.seed(7)
 REAL_PROJECTS = Path.home() / ".claude" / "projects"  # read only
-allf = [p for _r, p, sz, _m, _s in gk.transcript_files(REAL_PROJECTS) if sz < 20_000_000]
+now = time.time()
+allf = sorted(p for _r, p, sz, _m, mt in gk.transcript_files(REAL_PROJECTS)
+              if sz < 20_000_000 and now - mt > 3600)
 sample = random.sample(allf, min(120, len(allf)))
+print(f"population={len(allf)} sample={len(sample)}")
 mism = 0
+cr_bad = 0
+crlf_in_sample = 0
 for p in sample:
     raw = p.read_bytes()
+    crlf_in_sample += b"\r\n" in raw
     ls, lnew, ld = legacy.analyse(p)
     ns, nnew, nd = new.analyse_bytes(p, raw)
-    lnorm = None if lnew is None else [x.encode("utf-8", "surrogateescape") for x in lnew]
-    if (ls.get("blocks_removed"), ls.get("lines_removed"), ls.get("relinked"), lnorm, [(d[0], d[2]) for d in ld]) != \
-       (ns.get("blocks_removed"), ns.get("lines_removed"), ns.get("relinked"), nnew, [(d[0], d[2]) for d in nd]):
+    lnorm = None if lnew is None else [strip_cr(x.encode("utf-8", "surrogateescape")) for x in lnew]
+    nnorm = None if nnew is None else [strip_cr(x) for x in nnew]
+    left = (ls.get("blocks_removed"), ls.get("lines_removed"), ls.get("relinked"), lnorm,
+            [(d[0], strip_cr(d[2].encode("utf-8", "surrogateescape"))) for d in ld])
+    right = (ns.get("blocks_removed"), ns.get("lines_removed"), ns.get("relinked"), nnorm,
+             [(d[0], strip_cr(d[2].encode("utf-8", "surrogateescape"))) for d in nd])
+    if left != right:
         mism += 1
         print("   mismatch in", p)
+    if nnew is not None:
+        lines, touched = touched_flags(raw)
+        out_set = set(nnew)
+        if any(ln.endswith(b"\r") and not t and ln not in out_set for ln, t in zip(lines, touched)):
+            cr_bad += 1
+            print("   CR lost on an untouched line in", p)
 check(f"equivalence on {len(sample)} real transcripts", mism == 0 and len(sample) > 0, f"mismatches={mism}")
+check("v2 keeps the CR on untouched lines (real transcripts)", cr_bad == 0, f"files_with_CR_lost={cr_bad}")
+print(f"crlf_in_sample={crlf_in_sample}")
 
 # ---- sweep, isolation, caching, gate (all on a temporary corpus) ----
 tmp = Path(tempfile.mkdtemp(prefix="apiv2_", dir=_HOME))
@@ -186,3 +240,4 @@ with contextlib.redirect_stdout(buf):
 check("sweep() respects the cooldown and exits quickly", rc == 0 and "cooldown" in buf.getvalue(), buf.getvalue().strip())
 
 print(f"\n{sum(RESULTS)}/{len(RESULTS)} checks passed")
+sys.exit(0 if RESULTS and all(RESULTS) else 1)
