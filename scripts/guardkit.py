@@ -281,7 +281,12 @@ def run_pool(fn, items, workers: int = POOL_WORKERS):
 
 
 class CleanCache:
-    """Files verified clean at an exact (size, mtime_ns). Any change to a file invalidates its entry."""
+    """Files verified clean at an exact (size, mtime_ns).
+
+    A change that alters the size or the mtime invalidates the entry. The key is metadata, not
+    content: a rewrite that keeps both the size and the mtime is not detected. Repairs replace the
+    file with os.replace, which gives it a new mtime, so repaired files are re-checked.
+    """
 
     def __init__(self, name: str):
         self.path = STATE_DIR / f"{name}.json"
