@@ -140,6 +140,34 @@ def test_refuses_when_history_rewritten():
     expect(v2.OFFICIAL_HISTORY.read_bytes() == before, "refused merge changed history.jsonl")
 
 
+def test_refuses_when_later_bytes_rewritten():
+    reset_home()
+    write_parallel([prompt("s1", i, text=f"prompt number {i} " + "x" * 60) for i in range(100)])
+    expect(merge(0).status == "ok", "first merge did not succeed")
+    st = gk.load_json(v2.STATE_FILE, None)
+    offset = st["history_offset"]
+    expect(offset > 8192, f"history is {offset} bytes, need more than 8 KB")
+    write_parallel([prompt("s2", i) for i in range(5)])
+    pos = offset - 100                                  # inside the tail window, after byte 4096
+    expect(4096 < pos and offset - 4096 <= pos < offset, f"position {pos} is outside the tail window")
+    with open(v2.OFFICIAL_HISTORY, "r+b") as f:         # change one byte near the recorded offset
+        f.seek(pos)
+        old = f.read(1)
+        f.seek(pos)
+        f.write(b"Y" if old == b"Z" else b"Z")
+    expect(v2._head_sha(v2.OFFICIAL_HISTORY, offset) == st["history_head_sha"],
+           "head changed; this test must isolate the tail check")
+    before_history = v2.OFFICIAL_HISTORY.read_bytes()
+    before_state = v2.STATE_FILE.read_bytes()
+    before_keys = v2.KEYS_FILE.read_bytes()
+    r = merge(0)
+    expect(r.status == "refused", f"expected refused, got {r.status}: {r.detail}")
+    expect(r.added == 0, f"refused merge reports added {r.added}")
+    expect(v2.OFFICIAL_HISTORY.read_bytes() == before_history, "refused merge changed history.jsonl")
+    expect(v2.STATE_FILE.read_bytes() == before_state, "refused merge changed the state")
+    expect(v2.KEYS_FILE.read_bytes() == before_keys, "refused merge changed the keys file")
+
+
 def test_state_rebuild():
     reset_home()
     write_parallel([prompt("s1", i) for i in range(40)])
@@ -235,6 +263,7 @@ TESTS = [
     test_append_only_no_loss_with_external_writer,
     test_no_duplicates_on_repeat,
     test_refuses_when_history_rewritten,
+    test_refuses_when_later_bytes_rewritten,
     test_state_rebuild,
     test_register_uses_payload,
     test_lock_busy_returns_busy,

@@ -9,7 +9,9 @@ lines with O_APPEND, under the lock `session-index`, and only after checking tha
 it has already indexed have not changed.
 
 State, in guardkit.STATE_DIR:
-  index_state.json   {"history_offset", "history_head_sha", "keys_file"}
+  index_state.json   {"history_offset", "history_head_sha", "tail_sha", "keys_file"}
+                     head_sha: sha256 of the first min(4096, offset) bytes
+                     tail_sha: sha256 of the min(4096, offset) bytes that end at offset
   index_keys.bin     one 16-byte BLAKE2b digest per known key; only ever appended to
   index_last_merge   time of the last merge attempt that got the lock (the throttle)
 
@@ -113,6 +115,19 @@ def _head_sha(path: Path, offset: int) -> str:
     return h.hexdigest()
 
 
+def _tail_sha(path: Path, offset: int) -> str:
+    """sha256 of the min(HEAD_BYTES, offset) bytes that end at `offset`."""
+    n = min(HEAD_BYTES, offset)
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset - n)
+            h.update(f.read(n))
+    except FileNotFoundError:
+        pass
+    return h.hexdigest()
+
+
 def _read_complete_lines(path: Path, start: int):
     """Bytes from `start` through the last newline, and the offset just after them.
 
@@ -163,8 +178,8 @@ def _load_state():
     st = gk.load_json(STATE_FILE, None)
     if not isinstance(st, dict):
         return None
-    offset, sha = st.get("history_offset"), st.get("history_head_sha")
-    if not isinstance(offset, int) or offset < 0 or not isinstance(sha, str):
+    offset, head, tail = st.get("history_offset"), st.get("history_head_sha"), st.get("tail_sha")
+    if not isinstance(offset, int) or offset < 0 or not isinstance(head, str) or not isinstance(tail, str):
         return None
     return st
 
@@ -173,6 +188,7 @@ def _save_state(offset: int) -> None:
     gk.atomic_write_json(STATE_FILE, {
         "history_offset": offset,
         "history_head_sha": _head_sha(OFFICIAL_HISTORY, offset),
+        "tail_sha": _tail_sha(OFFICIAL_HISTORY, offset),
         "keys_file": KEYS_NAME,
     })
 
@@ -253,7 +269,9 @@ def _merge_locked() -> MergeResult:
         notes.append("state rebuilt from history.jsonl")
     else:
         offset = state["history_offset"]
-        if _head_sha(OFFICIAL_HISTORY, offset) != state["history_head_sha"]:
+        # Invariant 5: the indexed prefix must still hold its first and its last bytes.
+        if (_head_sha(OFFICIAL_HISTORY, offset) != state["history_head_sha"]
+                or _tail_sha(OFFICIAL_HISTORY, offset) != state["tail_sha"]):
             return MergeResult("refused", 0,
                                "history.jsonl changed outside the indexer; nothing written")
         offset, fresh, bad = _catch_up(keys, offset)
