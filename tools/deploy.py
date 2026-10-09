@@ -12,9 +12,11 @@ settings file and never touches hooks.
   python tools/deploy.py                        dry run, default target (the live folder)
   python tools/deploy.py --target DIR           dry run, against DIR
   python tools/deploy.py --target DIR --apply   copy new and differing files to DIR
+  python tools/deploy.py --check --target DIR   read only: compare repo copies with DIR (exit 0 only if all same)
 """
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -101,8 +103,48 @@ def write_atomic(src: Path, dst: Path) -> None:
         raise
 
 
+def repo_commit(repo: Path):
+    """git HEAD of the repo folder, or None if git is missing or fails. Never raises."""
+    try:
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo),
+                           capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.decode("utf-8", "replace").strip() or None
+
+
+def manifest_path(backup_root: Path, stamp: str) -> Path:
+    """Manifests sit in a sibling folder of the backup root, named after the run stamp."""
+    return backup_root.parent / "deploy-manifests" / f"{stamp}.json"
+
+
+def write_manifest(path: Path, data: dict) -> None:
+    """Write data as JSON: temp file in the same folder, fsync, then os.replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(data, indent=2, sort_keys=True) + "\n"
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(text.encode("utf-8"))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def apply(rows, src_dir: Path, target: Path, backup_root: Path):
-    """Copy every new or differing file. A differing target is backed up first. Returns counts."""
+    """Copy every new or differing file. A differing target is backed up first. Returns counts.
+
+    After a successful run, a manifest is written to manifest_path(), every time,
+    including when nothing was copied.
+    """
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     backup_dir = backup_root / stamp
     target.mkdir(parents=True, exist_ok=True)
@@ -119,12 +161,55 @@ def apply(rows, src_dir: Path, target: Path, backup_root: Path):
         if sha256(dst) != s:
             raise OSError(f"{name}: target does not match source after the copy")
         copied += 1
+    files = {}
+    for name, status, s, d in rows:
+        files[name] = {
+            "status": status,
+            "src_sha256": s,
+            "dst_sha256_before": d,
+            "dst_sha256_after": sha256(target / name),
+        }
+    manifest = {
+        "schema": 1,
+        "deployed_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "repo_commit": repo_commit(REPO),
+        "target": str(target),
+        "backup_root": str(backup_root),
+        "files": files,
+    }
+    write_manifest(manifest_path(backup_root, stamp), manifest)
     return copied, backed_up, backup_dir
 
 
 def show(rows) -> None:
     for name, status, s, d in rows:
         print(f"  {name:<20} {status:<8} src={s[:12]}  dst={d[:12] if d else '-'}")
+
+
+def run_check(target: Path) -> int:
+    """Read only. Compare the repo copies with target. Writes nothing and creates no folder.
+
+    Returns 0 only when every allowlisted name is same. A missing copy counts as missing.
+    """
+    print("mode: check (read only)")
+    print(f"target: {target}")
+    try:
+        rows = plan(SCRIPTS, target)
+    except OSError as e:
+        print(f"check: {e}")
+        return 1
+    bad = 0
+    for name, status, s, d in rows:
+        if status == "new":
+            status = "missing"
+        if status != "same":
+            bad += 1
+        print(f"  {name:<20} {status:<8} repo={s[:12]}  live={d[:12] if d else '-'}")
+    if bad:
+        print(f"check: {bad} differs or missing")
+        return 1
+    print("check: all same")
+    return 0
 
 
 def main(argv=None) -> int:
@@ -136,7 +221,15 @@ def main(argv=None) -> int:
                     help="destination folder (default: <CLAUDE_DIR>/session-tools)")
     ap.add_argument("--backup-root", type=Path, default=gk.CLAUDE_DIR / "backups" / "deploy",
                     help="where replaced files are kept (default: <CLAUDE_DIR>/backups/deploy)")
+    ap.add_argument("--check", action="store_true",
+                    help="read only: compare repo copies with --target; exit 0 only if all are same")
     args = ap.parse_args(argv)
+
+    if args.check:
+        if args.apply:
+            print("refused: --check and --apply together")
+            return 2
+        return run_check(args.target)
 
     print(f"mode: {'APPLY' if args.apply else 'dry run'}")
     print(f"target: {args.target}")
@@ -161,6 +254,7 @@ def main(argv=None) -> int:
     print(f"applied: copied={copied} backed_up={backed_up} same={sum(1 for r in rows if r[1] == 'same')}")
     if backed_up:
         print(f"backups: {backup_dir}")
+    print(f"manifest: {manifest_path(args.backup_root, backup_dir.name)}")
     return 0
 
 
