@@ -191,5 +191,69 @@ MA = MF / "absent"
 rc9, out9 = deploy(MR, "--check", "--target", MA / "session-tools")
 check("check does not create a missing target folder", rc9 == 1 and not MA.exists(), f"rc={rc9}")
 
+# 7. Gate hardening (PR-22). Each block gets its own fixture repo under FIX. Fixture test files are
+# written as bytes, so their line endings are LF. sh needs LF.
+SH_OK = b'#!/bin/sh\necho "PASS one"\necho "PASS two"\nexit 0\n'
+SH_FAIL = b'#!/bin/sh\necho "PASS one"\nexit 1\n'
+PY_FAIL_LINE = b'print("FAIL fixture line")\n'
+PY_FAIL_STDERR = (b'import sys\nsys.stdout.write("ok")\nsys.stdout.flush()\n'
+                  b'sys.stderr.write("FAIL on stderr\\n")\n')
+NO_SH_MSG = "gate: no sh program found; refusing to deploy"
+
+def gate_repo(label, tests):
+    """make_repo, plus extra files in tests/ (a dict of file name to bytes)."""
+    g = make_repo(label)
+    for fname, data in tests.items():
+        (g / "tests" / fname).write_bytes(data)
+    return g
+
+def gate_target(label):
+    base = FIX / (label + "_out")
+    return base / "session-tools", base / "backups"
+
+def deploy_with_env(root, env, *args):
+    r = subprocess.run([sys.executable, "-I", str(root / "tools" / "deploy.py"), *[str(a) for a in args]],
+                       capture_output=True, cwd=str(root), env=env)
+    return r.returncode, (r.stdout + r.stderr).decode("utf-8", "replace")
+
+# (i) a .py test that exits 0 but prints a FAIL line blocks the deploy; nothing is copied
+g = gate_repo("gate_i", {"test_zz_fail_line.py": PY_FAIL_LINE})
+tgt, bak = gate_target("gate_i")
+rc, out = deploy(g, "--apply", "--target", tgt, "--backup-root", bak)
+check("gate: FAIL line with exit 0 blocks the deploy", rc != 0
+      and "gate: FAIL tests/test_zz_fail_line.py exit=0" in out and not tgt.exists(), f"rc={rc}")
+
+# (ii) a .sh test that exits 1 blocks the deploy; nothing is copied
+g = gate_repo("gate_ii", {"test_zz_sh_fail.sh": SH_FAIL})
+tgt, bak = gate_target("gate_ii")
+rc, out = deploy(g, "--apply", "--target", tgt, "--backup-root", bak)
+check("gate: .sh test with exit 1 blocks the deploy", rc != 0
+      and "gate: FAIL tests/test_zz_sh_fail.sh exit=1" in out and not tgt.exists(), f"rc={rc}")
+
+# (iii) a .sh test that exits 0 with PASS lines passes; the dry run shows it ran
+g = gate_repo("gate_iii", {"test_zz_sh_ok.sh": SH_OK})
+tgt, bak = gate_target("gate_iii")
+rc, out = deploy(g, "--target", tgt, "--backup-root", bak)
+check("gate: .sh test with exit 0 passes", rc == 0
+      and "gate: PASS tests/test_zz_sh_ok.sh exit=0" in out and "dry run: nothing written" in out, f"rc={rc}")
+
+# (iv) no sh on PATH: refuse before any test runs, and copy nothing
+g = gate_repo("gate_iv", {"test_zz_sh_ok.sh": SH_OK})
+nosh = FIX / "gate_iv_nosh_path"
+nosh.mkdir(parents=True, exist_ok=True)
+env = dict(os.environ)
+env["PATH"] = str(nosh)  # an empty folder, for this child process only; this process's PATH is unchanged
+tgt, bak = gate_target("gate_iv")
+rc, out = deploy_with_env(g, env, "--apply", "--target", tgt, "--backup-root", bak)
+check("gate: no sh on PATH refuses before any test runs", rc != 0 and NO_SH_MSG in out
+      and "gate: PASS" not in out and "gate: FAIL" not in out and not tgt.exists(), f"rc={rc}")
+
+# (v) a FAIL line on stderr, right after an unterminated stdout line, still blocks the deploy
+g = gate_repo("gate_v", {"test_zz_stderr_fail.py": PY_FAIL_STDERR})
+tgt, bak = gate_target("gate_v")
+rc, out = deploy(g, "--apply", "--target", tgt, "--backup-root", bak)
+check("gate: FAIL line on stderr after unterminated stdout blocks", rc != 0
+      and "gate: FAIL tests/test_zz_stderr_fail.py exit=0" in out and not tgt.exists(), f"rc={rc}")
+
 print(f"\n{sum(RESULTS)}/{len(RESULTS)} checks passed")
 sys.exit(0 if all(RESULTS) else 1)

@@ -3,8 +3,11 @@
 
 A dry run by default. Nothing is written unless --apply is given.
 
-Before anything else, every tests/test_*.py in this repo is run with python -I.
-If any test fails, or there are no tests, the deploy exits non-zero and copies nothing.
+Before anything else, every tests/test_*.py in this repo is run with python -I, and every
+tests/*.sh with sh. A test fails if its exit code is not 0, or if a line of its output starts
+with FAIL, even when its exit code is 0. If any test fails, if there are no tests/test_*.py
+files, or if there is a tests/*.sh file and no sh program is on PATH, the deploy exits
+non-zero and copies nothing.
 
 Only the names in ALLOWLIST are ever copied. The deploy never reads or writes a
 settings file and never touches hooks.
@@ -43,24 +46,48 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+NO_SH_MESSAGE = "gate: no sh program found; refusing to deploy"
+
+
+def has_fail_line(text: str) -> bool:
+    """True when some line of text starts with FAIL. Case-sensitive, anchored at the start of the line."""
+    return any(line.startswith("FAIL") for line in text.splitlines())
+
+
 def run_gate(repo: Path) -> bool:
-    """Run every tests/test_*.py with python -I. True only if all pass and at least one exists."""
+    """Run every tests/test_*.py with python -I, then every tests/*.sh with sh. True only if all pass.
+
+    A test passes only when its exit code is 0 and no line of its stdout or of its stderr starts with FAIL.
+    Every test runs before the result is decided. At least one tests/test_*.py must exist.
+    If a tests/*.sh file exists and no sh program is found, the gate refuses before any test runs.
+    """
     tests = sorted((repo / "tests").glob("test_*.py"))
     if not tests:
         print("gate: no tests found; refusing to deploy")
         return False
+    shells = sorted((repo / "tests").glob("*.sh"))
+    sh = shutil.which("sh") if shells else None
+    if shells and sh is None:
+        print(NO_SH_MESSAGE)
+        return False
+    jobs = [(t.relative_to(repo).as_posix(), [sys.executable, "-I", str(t)]) for t in tests]
+    for s in shells:
+        rel = s.relative_to(repo).as_posix()
+        jobs.append((rel, [sh, rel]))
     ok = True
-    for t in tests:
-        name = t.relative_to(repo).as_posix()
+    for name, cmd in jobs:
         try:
-            r = subprocess.run([sys.executable, "-I", str(t)], cwd=str(repo),
-                               capture_output=True, timeout=GATE_TIMEOUT_S)
+            r = subprocess.run(cmd, cwd=str(repo), capture_output=True, timeout=GATE_TIMEOUT_S)
             rc = r.returncode
             out = (r.stdout + r.stderr).decode("utf-8", "replace")
+            fail_line = (has_fail_line(r.stdout.decode("utf-8", "replace"))
+                         or has_fail_line(r.stderr.decode("utf-8", "replace")))
         except subprocess.TimeoutExpired:
-            rc, out = -1, "timed out"
-        print(f"gate: {'PASS' if rc == 0 else 'FAIL'} {name} exit={rc}")
-        if rc != 0:
+            rc, out, fail_line = -1, "timed out", False
+        passed = rc == 0 and not fail_line
+        note = " (a line of its output starts with FAIL)" if rc == 0 and fail_line else ""
+        print(f"gate: {'PASS' if passed else 'FAIL'} {name} exit={rc}{note}")
+        if not passed:
             ok = False
             print("\n".join(out.splitlines()[-30:]))
     return ok
