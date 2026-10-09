@@ -27,6 +27,7 @@ Known limits: a rewrite confined to the middle of an indexed prefix is not detec
 - `tests/test_api_v2.py`: exits 1 when any check fails, so the deploy gate can see a failure. Its real-transcript check reads only transcripts older than one hour and strips one trailing CR from each line before it compares the two outputs. A new check confirms that untouched CRLF lines keep their CR.
 - `tests/test_guardkit.py`: pins the accepted limit that a same-size rewrite with a restored mtime is reported clean (QUEUE K2).
 - `tests/test_guard_hook_e2e_pr18.py`: an end-to-end test that runs `scripts/guard_hook.py` as a child process for each documented hook payload and reads back the results.
+- `tools/deploy.py`: the gate also runs `tests/*.sh` with `sh`, and refuses when a `.sh` test exists and no `sh` program is found. A test fails when its output has a line starting with `FAIL`, even if its exit code is 0. `tests/test_deploy.py` checks each case with fixture repos.
 
 ## 1.4.0
 
