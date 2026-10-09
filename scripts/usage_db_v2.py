@@ -14,6 +14,8 @@ Differences from usage_db.py:
   - stats prints the deduplicated total and the raw per-line sum, both labelled.
   - export is a separate command. sync never writes CSV files.
   - sql opens the database read-only (mode=ro).
+  - writes are batched (PR-27): build is one transaction; sync, session and catch-up commit
+    every BATCH_FILES changed transcripts. Rows, offsets and rollups are unchanged.
 
 Paths come from guardkit.CLAUDE_DIR, so SESSION_GUARD_HOME redirects everything.
 
@@ -69,7 +71,10 @@ CATCHUP_SCHEDULE_FILE = ARCHIVE_DIR / "usage-catchup-schedule.json"   # PR-25: c
 
 SCHEMA_VERSION = 2          # 2 adds usage_rollup (PR-25)
 HASH_WINDOW = 4096          # bytes hashed at each end of the ingested prefix (as session_archive_v2)
-COMMIT_EVERY = 200          # changed transcripts per transaction
+BATCH_FILES = 500           # sync, session, catch-up: changed transcripts per transaction (PR-27).
+                            # A full build is ONE transaction (ingest), not batches.
+BULK_CACHE_KIB = 131072     # full build only: page cache (KiB) for its one transaction, so the
+                            # same index page is not written to the WAL again after each eviction.
 BUSY_TIMEOUT_MS = 60000
 SCHEMA_RUNS = 0             # how often create_schema() actually ran in this process (tests read it)
 COOLDOWN_SECONDS = 6 * 3600     # catch-up: at most one run per 6 hours (as api_repair_v2)
@@ -718,10 +723,13 @@ def _ingest_one(conn, rel: str, path: Path, st, prev, full: bool, dirty: set,
         start = 0
     rows, new_off = scan(path, start, st.st_size, _source_label(rel))
     if rows:
-        # Every message whose winner can change: the new keys, and the keys these uuids
-        # held before the upsert (an upsert may move a uuid to another message).
-        dirty.update((r[1], r[3]) for r in rows)
-        dirty.update(_old_keys(conn, [r[0] for r in rows]))
+        # A full build rewrites usage_dedup and usage_rollup from usage_events at its end, so it
+        # need not track which messages changed (PR-27). Sync must, for every changed message.
+        if not full:
+            # Every message whose winner can change: the new keys, and the keys these uuids
+            # held before the upsert (an upsert may move a uuid to another message).
+            dirty.update((r[1], r[3]) for r in rows)
+            dirty.update(_old_keys(conn, [r[0] for r in rows]))
         conn.executemany(INSERT_SQL, rows)
     head_sha, tail_sha = _checksums(path, new_off)
     if save_state:
@@ -731,11 +739,16 @@ def _ingest_one(conn, rel: str, path: Path, st, prev, full: bool, dirty: set,
 
 
 def ingest(full: bool = False) -> int:
-    """sync (full=False) or build (full=True). One transaction, committed every COMMIT_EVERY
-    changed transcripts. usage_dedup is refreshed for every message that changed."""
+    """sync (full=False): one transaction per BATCH_FILES changed transcripts, each with its
+    usage_dedup and usage_rollup refresh. build (full=True): ONE transaction for the whole run
+    (PR-27). The build rebuilds usage_dedup and usage_rollup from usage_events at its end, so a
+    batch boundary needs no consistency, and one commit writes each page once. A failure or a
+    crash rolls the whole build back to the state before it."""
     conn = _connect_rw()
     files = changed = total_rows = n = 0
     try:
+        if full:                              # this connection only; it is closed below
+            conn.execute(f"PRAGMA cache_size=-{BULK_CACHE_KIB}")
         conn.execute("BEGIN IMMEDIATE")
         if full:
             conn.execute("DELETE FROM usage_dedup")
@@ -757,7 +770,9 @@ def ingest(full: bool = False) -> int:
 
 def _run_sources(conn, entries, full: bool, save_state: bool = True, rollup_sids=None):
     """The per-source loop of sync, build, session and catch-up. The caller holds BEGIN IMMEDIATE
-    and issues the final COMMIT. Commits every COMMIT_EVERY changed sources, as before."""
+    and issues the final COMMIT. A sync, session or catch-up commits every BATCH_FILES changed
+    sources (PR-27 raised it from 200). A full build never commits here: its one transaction is
+    the caller's."""
     files = changed = total_rows = 0
     state = {} if full else _load_state(conn)
     dirty = set()
@@ -772,7 +787,7 @@ def _run_sources(conn, entries, full: bool, save_state: bool = True, rollup_sids
             continue
         changed += 1
         total_rows += _ingest_one(conn, rel, path, st, prev, full, dirty, save_state)
-        if changed % COMMIT_EVERY == 0:
+        if not full and changed % BATCH_FILES == 0:
             _flush_dirty(conn, dirty, rollup=not full, rollup_sids=rollup_sids)
             conn.execute("COMMIT")
             conn.execute("BEGIN IMMEDIATE")
