@@ -211,7 +211,7 @@ def step_usage(payload: dict) -> str:
 
 
 def step_repair(payload: dict) -> str:
-    # The payload (with end_reason) goes on stdin. from-hook refuses to repair when end_reason is resume.
+    # The payload (with reason and end_reason) goes on stdin. from-hook refuses to repair when reason or end_reason is resume.
     run_tool("api_repair_v2 from-hook", [_script("api_repair_v2.py"), "from-hook"],
              DEADLINES["repair"], _json_bytes(payload))
     return "ok"
@@ -280,7 +280,7 @@ def main(argv=None, payload=None) -> int:
         payload = guardkit.read_hook_payload()
     if not isinstance(payload, dict):
         payload = {}
-    keep = ("session_id", "transcript_path", "cwd") + (("end_reason",) if event == "SessionEnd" else ())
+    keep = ("session_id", "transcript_path", "cwd") + (("reason", "end_reason") if event == "SessionEnd" else ())
     payload = {k: payload[k] for k in keep if k in payload}
     t0 = time.perf_counter()
     try:

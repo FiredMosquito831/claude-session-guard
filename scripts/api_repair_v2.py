@@ -421,7 +421,10 @@ def scan_all() -> int:
 
 def cmd_from_hook() -> int:
     data = gk.read_hook_payload()
-    reason = str(data.get("end_reason", "")).lower() or "-"
+    # reason (the documented SessionEnd field) is read first, end_reason second. A value counts only as a
+    # non-empty string, and is not stripped. The log shows "-" when neither is present.
+    chosen = next((data[k] for k in ("reason", "end_reason") if isinstance(data.get(k), str) and data[k]), "")
+    reason = chosen.lower() or "-"
     tp = str(data.get("transcript_path") or "")
     path = Path(tp) if tp else None
     if path is None or not path.is_file():
