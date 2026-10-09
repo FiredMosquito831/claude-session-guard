@@ -10,6 +10,7 @@ Under SESSION_GUARD_HOME/session-archive/ (default ~/.claude/session-archive/):
 
   transcripts/<rel>                        the archive of one transcript. It only grows.
   state/<rel>.json                         live_offset, head_sha, tail_sha, archive_size.
+  state/excused.json, state/excused.bin     verify's index of the removed-lines archive (PR-07)
   quarantine/<rel>.<stamp>.partial         archive bytes beyond the recorded size (crash path).
   quarantine/<rel>.<stamp>.before-restore  a live file's bytes before restore --merge-live.
 
@@ -334,29 +335,206 @@ def deliberately_removed_keys() -> set:
     return keys
 
 
+# ---- verify: excused-line index and the three-class canary (PR-07; F11, F20, F21) ----------
+# Each line that the archive has and the live file lacks is classed exactly once:
+#   excused             a readable removal record matches it: by uuid, or (no uuid) by source file and exact text
+#   excused_unreadable  no readable record matches, but a removal record that does not parse contains the
+#                       line's uuid as a token. Counted apart: not a loss, but the audit record is damaged.
+#   unexplained         neither of the above. This is the only class that drives the canary.
+# The index of the removed-lines archive is kept in ARCHIVE_DIR/state. It is refreshed from its recorded
+# offset, so a verify reads only the bytes appended since the previous one.
+
+ENTRY_SIZE = 17                                 # one index entry: a kind byte, then a 16-byte digest
+KIND_RECORD, KIND_UUID, KIND_UNREADABLE = 0, 1, 2
+EXCUSED_READ_BLOCK = 8 * 1024 * 1024            # the removed-lines archive is streamed in blocks this size
+UUID_TOKEN_RE = re.compile(rb"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _excused_paths():
+    """(excused.json, excused.bin) in the archive state folder, resolved at call time."""
+    state = ARCHIVE_DIR / "state"
+    return state / "excused.json", state / "excused.bin"
+
+
+def _removed_archive_path() -> Path:
+    return CLAUDE_DIR / "backups" / "sessions" / "removed-lines-archive.jsonl"
+
+
+def _digest(data: bytes) -> bytes:
+    return hashlib.blake2b(data, digest_size=16).digest()
+
+
+def _uuid_digest(uid: str) -> bytes:
+    return _digest(uid.encode("utf-8", "surrogateescape"))
+
+
+def _index_lines(lines, out: list) -> int:
+    """Append one index entry per key found on these raw lines of the removed-lines archive.
+    Returns how many of the lines do not parse."""
+    unreadable = 0
+    for raw in lines:
+        if not raw.strip():
+            continue
+        try:
+            rec = json.loads(raw.decode("utf-8", "surrogateescape"))
+        except ValueError:
+            unreadable += 1
+            for m in UUID_TOKEN_RE.finditer(raw):      # a single pass over the raw bytes
+                out.append(bytes([KIND_UNREADABLE]) + _digest(m.group(0)))
+            continue
+        if not isinstance(rec, dict) or not isinstance(rec.get("content"), str):
+            continue
+        content = rec["content"]
+        if isinstance(rec.get("source_file"), str):
+            # The key of guardkit's removed-lines index (PR-09). The raw and the stripped form are both
+            # keyed, because the archiver stores the stripped line.
+            out.append(bytes([KIND_RECORD]) + guardkit._record_digest(rec["source_file"], content))
+            stripped = content.strip()
+            if stripped != content:
+                out.append(bytes([KIND_RECORD]) + guardkit._record_digest(rec["source_file"], stripped))
+        try:
+            inner = json.loads(content)
+        except ValueError:
+            continue
+        uid = inner.get("uuid") if isinstance(inner, dict) else None
+        if isinstance(uid, str) and uid:
+            out.append(bytes([KIND_UUID]) + _uuid_digest(uid))
+    return unreadable
+
+
+def _split_entries(blob: bytes) -> dict:
+    sets = {KIND_RECORD: set(), KIND_UUID: set(), KIND_UNREADABLE: set()}
+    for i in range(0, len(blob) - ENTRY_SIZE + 1, ENTRY_SIZE):
+        s = sets.get(blob[i])
+        if s is not None:
+            s.add(blob[i + 1:i + ENTRY_SIZE])
+    return {"record": sets[KIND_RECORD], "uuid": sets[KIND_UUID], "unreadable_uuid": sets[KIND_UNREADABLE]}
+
+
+def refresh_excused_index() -> dict:
+    """Bring the index up to date with the removed-lines archive and return its key sets.
+
+    Reads only the bytes after the recorded archive offset, and only complete lines. The index is rebuilt
+    from the start when the archive is shorter than that offset, or when the recorded state and excused.bin
+    disagree. excused.bin is appended and fsynced first, and excused.json is replaced last, so a killed run
+    leaves the recorded state at the last complete refresh. Returns the three digest sets under "record",
+    "uuid" and "unreadable_uuid", and the total number of unreadable removal records under "unreadable_records".
+    """
+    archive = _removed_archive_path()
+    idx_json, idx_bin = _excused_paths()
+    state = guardkit.load_json(idx_json, None)
+    if not isinstance(state, dict):
+        state = {}
+    off, recorded = state.get("archive_offset"), state.get("bin_bytes")
+    unreadable_total = state.get("unreadable_records")
+    try:
+        size = archive.stat().st_size
+    except FileNotFoundError:
+        size = 0
+    try:
+        bin_size = idx_bin.stat().st_size
+    except FileNotFoundError:
+        bin_size = 0
+    usable = (type(off) is int and type(recorded) is int and type(unreadable_total) is int
+              and 0 <= off <= size and 0 <= recorded <= bin_size and recorded % ENTRY_SIZE == 0)
+    if usable:
+        base = b""
+        if recorded:
+            with open(idx_bin, "rb") as f:
+                base = f.read(recorded)
+    else:
+        off, recorded, unreadable_total, base = 0, 0, 0, b""
+    new, unreadable_new, consumed = [], 0, off
+    if size > off:
+        with open(archive, "rb") as f:
+            f.seek(off)
+            carry = b""
+            while True:
+                block = f.read(EXCUSED_READ_BLOCK)
+                if not block:
+                    break
+                buf = carry + block
+                cut = buf.rfind(b"\n") + 1              # complete lines only
+                if cut == 0:
+                    carry = buf
+                    continue
+                unreadable_new += _index_lines(buf[:cut].split(b"\n"), new)
+                consumed += cut
+                carry = buf[cut:]
+    blob = b"".join(new)
+    if not usable or blob or consumed != off or bin_size != recorded:
+        idx_bin.parent.mkdir(parents=True, exist_ok=True)
+        with open(idx_bin, "ab") as f:
+            f.truncate(recorded)                        # drop entries that a killed run left past the recorded state
+            f.write(blob)
+            f.flush()
+            os.fsync(f.fileno())
+        guardkit.atomic_write_json(idx_json, {
+            "archive_offset": consumed,
+            "bin_bytes": recorded + len(blob),
+            "unreadable_records": unreadable_total + unreadable_new,
+        })
+    return {**_split_entries(base + blob), "unreadable_records": unreadable_total + unreadable_new}
+
+
+def _verify_key(text: str):
+    """Line identity for verify: the uuid when the line is a JSON object with one, else the exact text.
+    Unlike _text_key, a line that is valid JSON but not an object is a raw line, not an error."""
+    try:
+        entry = json.loads(text)
+    except ValueError:
+        return ("raw", text)
+    uid = entry.get("uuid") if isinstance(entry, dict) else None
+    return ("uuid", uid) if uid else ("raw", text)
+
+
+def _classify_missing(key, text: str, live: Path, idx: dict) -> str:
+    """excused, excused_unreadable or unexplained, for one archived line that the live file lacks."""
+    if key[0] == "uuid":
+        uid = key[1]
+        if isinstance(uid, str):
+            d = _uuid_digest(uid)
+            if d in idx["uuid"]:
+                return "excused"
+            if d in idx["unreadable_uuid"]:
+                return "excused_unreadable"
+        return "unexplained"
+    # A line without a uuid cannot be searched for in an unreadable record (class 2 does not apply).
+    # Class 1 needs a readable record for this source file with the exact text.
+    if guardkit._record_digest(str(live), text) in idx["record"]:
+        return "excused"
+    return "unexplained"
+
+
 def cmd_verify() -> int:
+    """The canary. Exits 0 only when every archived line that is missing from its live copy has an explanation."""
     live_index = {str(r): p for r, p in iter_live_transcripts()}
     archived = [q for q in TRANSCRIPTS_DIR.rglob("*.jsonl")] if TRANSCRIPTS_DIR.exists() else []
-    excused = deliberately_removed_keys()
+    idx = refresh_excused_index()
 
     only_archived = []
     shrunk = []
-    excused_total = 0
+    classes = {"excused": 0, "excused_unreadable": 0, "unexplained": 0}
     for arch in archived:
         rel = arch.relative_to(TRANSCRIPTS_DIR)
         live = live_index.get(str(rel))
         if live is None:
             only_archived.append(arch)
             continue
-        a_keys = {_text_key(ln) for ln in _read_text_lines(arch)}
-        l_keys = {_text_key(ln) for ln in _read_text_lines(live)}
-        missing = a_keys - l_keys
-        if missing and excused:
-            before = len(missing)
-            missing = missing - excused
-            excused_total += before - len(missing)
-        if missing:
-            shrunk.append((str(rel), len(missing)))
+        l_keys = {_verify_key(ln) for ln in _read_text_lines(live)}
+        missing = {}                                    # key -> the archived text of that line
+        for ln in _read_text_lines(arch):
+            key = _verify_key(ln)
+            if key not in l_keys and key not in missing:
+                missing[key] = ln
+        unexplained = 0
+        for key, text in missing.items():
+            cls = _classify_missing(key, text, live, idx)
+            classes[cls] += 1
+            if cls == "unexplained":
+                unexplained += 1
+        if unexplained:
+            shrunk.append((str(rel), unexplained))
 
     print(f"[session-archive] archived sessions: {len(archived)}")
     print(f"[session-archive] live sessions:     {len(live_index)}")
@@ -368,13 +546,17 @@ def cmd_verify() -> int:
     print(f"[session-archive] live files missing archived lines: {len(shrunk)}"
           "   <-- the canary: anything above 0 is unexplained data loss")
     for name, n in shrunk[:20]:
-        print(f"    {name}: {n} lines only in archive")
+        print(f"    {name}: {n} unexplained lines, only in archive")
     if len(shrunk) > 20:
         print(f"    ... and {len(shrunk) - 20} more")
-    if excused_total:
-        print(f"[session-archive] ({excused_total} further missing lines were removed "
+    if classes["excused"]:
+        print(f"[session-archive] ({classes['excused']} further missing lines were removed "
               "deliberately by a repair tool and are archived, so not counted above)")
-    return 0
+    print(f"[session-archive] missing lines excused by an unreadable removal record: {classes['excused_unreadable']}"
+          " (the record does not parse; its uuid is still in it)")
+    print(f"[session-archive] missing lines unexplained: {classes['unexplained']}")
+    print(f"[session-archive] unreadable removal records found: {idx['unreadable_records']}")
+    return 0 if classes["unexplained"] == 0 else 1
 
 
 RESTORE_QUIET_SECONDS = 3600    # restore leaves a live file alone if it changed more recently than this
