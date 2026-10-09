@@ -22,13 +22,15 @@ Speed
   * The running-session process check runs only when there is something to repair.
 
 Safety
-  * Removed content is copied to the permanent archive before any write.
+  * Removed content is copied to the permanent archive after the backup and the change check,
+    and before the rewrite. A line already in the archive is never archived again.
   * Writes are atomic; a backup is taken first.
   * A file that changes while it is being checked is left alone.
   * Recently written files and the running session are skipped.
   * Each repaired file's append offsets are invalidated, so the archive and usage
     syncs re-read it in full next time.
 """
+import hashlib
 import json
 import os
 import re
@@ -48,6 +50,7 @@ ACTIVE_SKIP_SECONDS = 3600
 COOLDOWN_SECONDS = 6 * 3600
 MAX_SWEEPS_PER_DAY = 4
 SCHEDULE_FILE = gk.STATE_DIR / "api_repair_schedule.json"
+INDEX_READ_BLOCK = 8 * 1024 * 1024       # the removed-lines index streams the archive in blocks this size
 
 # Superset of every thinking value that can be empty or whitespace-only (or null):
 #   "thinking": ""   "thinking": "\n\n"   "thinking": " "   "thinking": null
@@ -124,26 +127,25 @@ def analyse_bytes(path, raw: bytes):
                 uid = remap[uid]
             return uid
 
-        pat = re.compile(b"|".join(re.escape(u.encode("utf-8")) for u in remap))
+        # One pass over the lines that carry a "parentUuid" key. The earlier alternation of every
+        # removed uuid cost 2.5 s on a 0.75 MB transcript with 2,000 removed uuids (PR-03, Step 6).
         visited = set()
-        for m in pat.finditer(raw):
-            s, e = _line_bounds(raw, m.start())
-            if s in drop or s in visited:
-                continue
-            visited.add(s)
-            o = changed.get(s)
-            if o is None:
-                try:
-                    o = json.loads(raw[s:e].decode("utf-8", "surrogateescape").strip())
-                except ValueError:
-                    continue
-                if not isinstance(o, dict):
-                    continue
-            parent = o.get("parentUuid")
-            if parent in remap:
-                o["parentUuid"] = resolve(parent)
-                changed[s] = o
-                stats["relinked"] += 1
+        at = raw.find(b'"parentUuid"')
+        while at != -1:
+            s, e = _line_bounds(raw, at)
+            if s not in drop and s not in visited:
+                visited.add(s)
+                o = changed.get(s)
+                if o is None:
+                    try:
+                        o = json.loads(raw[s:e].decode("utf-8", "surrogateescape").strip())
+                    except ValueError:
+                        o = None
+                if isinstance(o, dict) and isinstance(o.get("parentUuid"), str) and o["parentUuid"] in remap:
+                    o["parentUuid"] = resolve(o["parentUuid"])
+                    changed[s] = o
+                    stats["relinked"] += 1
+            at = raw.find(b'"parentUuid"', e)
 
     out = []
     pos, size = 0, len(raw)
@@ -173,38 +175,174 @@ def make_backup(path: Path) -> Path:
     return dest
 
 
-def archive_dropped(path: Path, dropped) -> None:
+def _index_paths():
+    """The digest index of the removed-lines archive, kept in the state folder."""
+    return gk.STATE_DIR / "removed_index.json", gk.STATE_DIR / "removed_index.bin"
+
+
+def _record_digest(source_file: str, content: str) -> bytes:
+    """16-byte identity of one archived record: its source file and its exact content."""
+    key = source_file.encode("utf-8", "surrogateescape") + b"\0" + content.encode("utf-8", "surrogateescape")
+    return hashlib.blake2b(key, digest_size=16).digest()
+
+
+def _refresh_removed_index() -> set:
+    """Index the archive records written since the last refresh, and return every known digest.
+
+    Call with the archive lock held. Only complete lines are read. The new digests are appended to
+    removed_index.bin and synced before the offset is recorded in removed_index.json. If the archive
+    is smaller than the recorded offset, it was truncated or replaced, so the index is rebuilt.
+    """
+    idx_json, idx_bin = _index_paths()
+    state = gk.load_json(idx_json, None)
+    offset = state.get("archive_offset") if isinstance(state, dict) else None
+    try:
+        archive_size = REMOVED_LINES_ARCHIVE.stat().st_size
+    except FileNotFoundError:
+        archive_size = 0
+    rebuild = not isinstance(offset, int) or offset < 0 or archive_size < offset
+    if rebuild:
+        if isinstance(offset, int) and offset > archive_size:
+            msg = (f"removed-lines archive is smaller than its index ({archive_size} < {offset} bytes); "
+                   "index rebuilt from the start")
+            print("[api-repair] warning: " + msg, file=sys.stderr)
+            gk.log_line("api_repair", "warning: " + msg)
+        offset = 0
+    new, bad, consumed = [], 0, offset      # consumed: archive offset through the last complete line
+    try:
+        f = open(REMOVED_LINES_ARCHIVE, "rb")
+    except FileNotFoundError:
+        f = None
+    if f is not None:
+        with f:
+            f.seek(offset)
+            carry = b""
+            while True:
+                block = f.read(INDEX_READ_BLOCK)  # streamed: the real archive is about 2 GB
+                if not block:
+                    break
+                buf = carry + block
+                cut = buf.rfind(b"\n") + 1
+                if cut == 0:
+                    carry = buf
+                    continue
+                for raw_line in buf[:cut].split(b"\n"):
+                    if not raw_line.strip():
+                        continue
+                    try:
+                        rec = json.loads(raw_line.decode("utf-8", "surrogateescape"))
+                    except ValueError:
+                        bad += 1
+                        continue
+                    if not isinstance(rec, dict) or not isinstance(rec.get("source_file"), str) \
+                            or not isinstance(rec.get("content"), str):
+                        bad += 1
+                        continue
+                    new.append(_record_digest(rec["source_file"], rec["content"]))
+                consumed += cut
+                carry = buf[cut:]
+    if bad:
+        gk.log_line("api_repair", f"removed-lines archive: {bad} unreadable record(s) skipped while indexing")
+    idx_bin.parent.mkdir(parents=True, exist_ok=True)
+    with open(idx_bin, "a+b") as f:
+        size = f.seek(0, os.SEEK_END)
+        keep = 0 if rebuild else size // 16 * 16  # drop a partial digest left by a killed write
+        if keep != size:
+            f.truncate(keep)
+        if new:
+            f.write(b"".join(new))
+        f.flush()
+        os.fsync(f.fileno())
+        f.seek(0)
+        data = f.read()
+    gk.atomic_write_json(idx_json, {"archive_offset": consumed})
+    return {data[i:i + 16] for i in range(0, len(data) // 16 * 16, 16)}
+
+
+def _unlink_quiet(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def archive_dropped(path: Path, dropped) -> tuple:
+    """Append each removed record to the permanent archive, once. Returns (written, skipped).
+
+    A record is identified by its source file and its exact content, so a record already in the
+    archive is skipped. Content is written as surrogateescape bytes, so invalid UTF-8 is kept
+    byte for byte. The archive lock is held from the index check to the last write.
+    """
     BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().isoformat()
     lock = gk.lock_wait("removed-lines-archive", timeout=60)
     if lock is None:
         raise RuntimeError("the removed-lines archive is locked by another process")
     try:
-        with open(REMOVED_LINES_ARCHIVE, "a", encoding="utf-8") as f:
-            for lineno, reason, raw in dropped:
-                f.write(json.dumps({"archived_at": stamp, "source_file": str(path),
-                                    "source_line": lineno, "reason": reason,
-                                    "content": raw}, ensure_ascii=False) + "\n")
+        known = _refresh_removed_index()
+        source = str(path)
+        written = skipped = 0
+        new_digests, offset = [], None
+        with open(REMOVED_LINES_ARCHIVE, "ab") as f:
+            for lineno, reason, content in dropped:
+                digest = _record_digest(source, content)
+                if digest in known:
+                    skipped += 1
+                    continue
+                rec = {"archived_at": stamp, "source_file": source, "source_line": lineno,
+                       "reason": reason, "content": content}
+                f.write(json.dumps(rec, ensure_ascii=False).encode("utf-8", "surrogateescape") + b"\n")
+                known.add(digest)
+                new_digests.append(digest)
+                written += 1
             f.flush()
             os.fsync(f.fileno())
+            if written:
+                offset = f.tell()                 # our own last write; never a stat, others may append
+        if new_digests:
+            idx_json, idx_bin = _index_paths()
+            with open(idx_bin, "ab") as f:
+                f.write(b"".join(new_digests))
+                f.flush()
+                os.fsync(f.fileno())
+            gk.atomic_write_json(idx_json, {"archive_offset": offset})
+        return written, skipped
     finally:
         lock.release()
 
 
+def _changed(path: Path, st) -> bool:
+    """True when the file is gone, or its size or mtime differs from `st`, the stat taken at the start."""
+    try:
+        now = path.stat()
+    except OSError:
+        return True
+    return (now.st_mtime_ns, now.st_size) != (st.st_mtime_ns, st.st_size)
+
+
 def repair_file(path: Path, dry_run: bool = True, force=False) -> dict:
+    """Repair one transcript. Writes happen in this order: backup, archive of the removed lines
+    (only after the change check), then the atomic replace (only after a second change check)."""
     try:
         st_before = path.stat()
     except OSError as e:
         return {"file": str(path), "error": f"stat failed: {e}"}
-    active = os.environ.get("CLAUDE_SESSION_ID", "").strip()
-    if dry_run or force == "session_end":
+    if dry_run:
         pass
+    elif force == "session_end":
+        # The session that just ended was written seconds ago, so there is no recency check here,
+        # and CLAUDE_SESSION_ID is not read (at SessionEnd it can name the session being repaired).
+        # The only skip is a session whose id is still on a running command line.
+        if path.stem in running_session_ids():
+            return {"file": str(path), "skipped": "refusing: session is still running"}
     elif not force:
+        active = os.environ.get("CLAUDE_SESSION_ID", "").strip()
         if active and path.stem == active:
             return {"file": str(path), "skipped": "active session"}
         if time.time() - st_before.st_mtime < ACTIVE_SKIP_SECONDS:
             return {"file": str(path), "skipped": "modified recently (possibly live)"}
     else:
+        active = os.environ.get("CLAUDE_SESSION_ID", "").strip()
         if active and path.stem == active:
             return {"file": str(path), "skipped": "refusing: this is the running session"}
         if time.time() - st_before.st_mtime < 120:
@@ -218,33 +356,32 @@ def repair_file(path: Path, dry_run: bool = True, force=False) -> dict:
     if dry_run:
         stats["dry_run"] = True
         return stats
+    if _changed(path, st_before):
+        stats["aborted"] = "file changed while being checked; left untouched"
+        return stats
+    stats["backup"] = str(make_backup(path))      # a copy is not a removal
+    if _changed(path, st_before):
+        stats["aborted"] = "file changed after backup; nothing archived"
+        return stats
     if dropped:
         try:
-            archive_dropped(path, dropped)
+            stats["archived"], stats["archive_skipped"] = archive_dropped(path, dropped)
         except Exception as e:
             stats["aborted"] = f"could not archive removed content ({e})"
             return stats
-    stats["backup"] = str(make_backup(path))
-    try:
-        st_now = path.stat()
-    except OSError as e:
-        stats["aborted"] = f"file vanished ({e})"
-        return stats
-    if (st_now.st_mtime_ns, st_now.st_size) != (st_before.st_mtime_ns, st_before.st_size):
-        stats["aborted"] = "file changed while being checked (concurrent append); left untouched"
-        return stats
     tmp = path.with_name(f"{path.name}.{os.getpid()}.apirepair-tmp")
     try:
         with open(tmp, "wb") as f:
             f.write(b"".join(ln + b"\n" for ln in new_lines))
             f.flush()
             os.fsync(f.fileno())
+        if _changed(path, st_before):
+            _unlink_quiet(tmp)
+            stats["aborted"] = "file changed before replace; temp removed"
+            return stats
         os.replace(tmp, path)
     except OSError as e:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+        _unlink_quiet(tmp)
         stats["aborted"] = f"atomic write failed ({e})"
         return stats
     try:
@@ -326,27 +463,29 @@ def sweep_incremental(workers: int = gk.POOL_WORKERS) -> dict:
             return ("clean", rel, st1)
         return ("changed", rel, None)
 
-    for _item, out, err in gk.run_pool(work, todo, workers):
-        res["checked"] += 1
-        if err is not None:
-            res["errors"] += 1
-            continue
-        kind, rel, payload = out
-        if kind == "clean":
-            cache.mark(rel, payload.st_size, payload.st_mtime_ns)
-        elif kind == "repaired":
-            res["repaired"] += 1
-            res["lines"] += payload.get("lines_removed", 0)
-            res["blocks"] += payload.get("blocks_removed", 0)
-            res["relinked"] += payload.get("relinked", 0)
-        elif kind == "aborted":
-            res["aborted"] += 1
-        elif kind == "error":
-            res["errors"] += 1
-        elif kind == "live":
-            res["live"] += 1
-    cache.prune(seen)
-    cache.save()
+    try:
+        for _item, out, err in gk.run_pool(work, todo, workers):
+            res["checked"] += 1
+            if err is not None:
+                res["errors"] += 1
+                continue
+            kind, rel, payload = out
+            if kind == "clean":
+                cache.mark(rel, payload.st_size, payload.st_mtime_ns)
+            elif kind == "repaired":
+                res["repaired"] += 1
+                res["lines"] += payload.get("lines_removed", 0)
+                res["blocks"] += payload.get("blocks_removed", 0)
+                res["relinked"] += payload.get("relinked", 0)
+            elif kind == "aborted":
+                res["aborted"] += 1
+            elif kind == "error":
+                res["errors"] += 1
+            elif kind == "live":
+                res["live"] += 1
+        cache.prune(seen)
+    finally:
+        cache.close()                             # saves what was verified, even if the sweep stops early
     return res
 
 
@@ -415,7 +554,11 @@ def cmd_from_hook() -> int:
     if path is None:
         gk.log_line("api_repair", f"from-hook end_reason={reason} no transcript found")
         return 0
-    r = repair_file(path, dry_run=False, force="session_end")
+    try:
+        r = repair_file(path, dry_run=False, force="session_end")
+    except Exception as e:
+        gk.log_line("api_repair", f"from-hook end_reason={reason} file={path.name} error={e}")
+        raise
     gk.log_line("api_repair",
                 f"from-hook end_reason={reason} file={path.name} blocks={r.get('blocks_removed', 0)} "
                 f"lines={r.get('lines_removed', 0)} relinked={r.get('relinked', 0)} "
