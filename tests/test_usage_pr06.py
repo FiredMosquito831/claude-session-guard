@@ -35,7 +35,7 @@ assert str(gk.CLAUDE_DIR).startswith(HOME), "test would touch real data"
 assert str(v2.CLAUDE_DIR).startswith(HOME), "test would touch real data"
 assert str(v2.DB_PATH).startswith(HOME), "test would touch real data"
 
-SLUG = "C--Users-fgghk-pr06-test"
+SLUG = "C--work-pr06-test"
 MODELS = ["claude-opus-4-1-20250805", "claude-sonnet-4-5-20250929",
           "claude-haiku-4-5-20251001", "mystery-local-model"]   # the last one has no price
 BASE = datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc)
@@ -54,7 +54,7 @@ def iso(dt):
 
 
 def usage_line(uuid, sid, mid, ts, model, inp, out, cc, cr, sidechain=False,
-               cwd="C:/Users/fgghk/proj-x"):
+               cwd="C:/work/proj-x"):
     cc5 = cc // 2
     obj = {"type": "assistant", "uuid": uuid, "sessionId": sid, "requestId": "req_" + uuid,
            "timestamp": ts, "cwd": cwd, "version": "2.1.0", "gitBranch": "main",
@@ -69,7 +69,7 @@ def usage_line(uuid, sid, mid, ts, model, inp, out, cc, cr, sidechain=False,
     return json.dumps(obj) + "\n"
 
 
-def make_lines(rng, tag, sid, n_msgs, sidechain=False, start=BASE, cwd="C:/Users/fgghk/proj-x"):
+def make_lines(rng, tag, sid, n_msgs, sidechain=False, start=BASE, cwd="C:/work/proj-x"):
     """Lines for n_msgs API responses. A response is written as 1 to 3 lines sharing message.id.
     Every line repeats the same usage, except the last, which carries the larger final usage.
     Some responses tie on total, so the timestamp decides. Noise lines are mixed in."""
@@ -432,7 +432,7 @@ def t_rewritten_prefix_forces_full_read():
     con = sqlite3.connect(str(v2.DB_PATH))
     proj = con.execute("SELECT project FROM usage_events WHERE uuid = ?", (uid,)).fetchone()[0]
     con.close()
-    assert proj == "C:/Users/fgghk/proj-REWRITTEN", f"rewritten line not re-read: {proj}"
+    assert proj == "C:/work/proj-REWRITTEN", f"rewritten line not re-read: {proj}"
     return "rewritten prefix detected and re-read from 0"
 
 
