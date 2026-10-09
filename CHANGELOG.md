@@ -14,6 +14,7 @@ These changes are in the repository and tested. The hooks in `hooks/hooks.json` 
 - `scripts/run.sh`: caches the interpreter path, so a hook call starts Python once on a cache hit.
 - `tools/deploy.py`: copies an allowlist of scripts to a target folder. Dry run by default; runs the tests first.
 - `scripts/guard_hook.py` and `scripts/api_repair_v2.py`: the SessionEnd repair reads the documented `reason` field, skips `resume`, and falls back to `end_reason`. The live v1 tool (`scripts/api_repair.py`) still reads `end_reason` until it is replaced.
+- `scripts/usage_db_v2.py` (PR-25): usage is read at session close (`session <path> <session_id>`: one bounded step per session, from the transcript path, never migrating), with a `catch-up` for sessions whose close never ran (at most one run per 6 h and four per 24 h, own schedule file), and a per-session `usage_rollup` table (schema 2). `migrate` creates the schema and is meant to run detached. Nothing is wired yet: the hooks still run `sync` on every turn until the wiring change is approved.
 
 Known limits: a rewrite confined to the middle of an indexed prefix is not detected; the 2026-10-07 and 2026-10-09 usage totals are not reconciled; prices are unverified; the skills (`usage-report`, `session-doctor`) describe the 1.4.0 tools until the v2 tools are wired.
 
