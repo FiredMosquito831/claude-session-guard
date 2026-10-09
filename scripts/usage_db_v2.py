@@ -37,6 +37,12 @@ Commands (same meaning as usage_db.py):
   sessions [N]     session timeline
   sql "<query>"    read-only SQL (mode=ro), tab-separated output
   schema           print the schema
+  session <path> <session_id>
+                   read one session's transcripts (main file and subagents) at session
+                   close. Never migrates: a schema below SCHEMA_VERSION prints "needs migrate".
+  catch-up         incremental over every transcript, for sessions whose close never ran.
+                   Limited to one run per 6 h and 4 per 24 h (its own schedule file).
+  migrate          create or migrate the schema (run detached, once, before session/catch-up)
 
 No external deps -- stdlib sqlite3 only.
 """
@@ -59,12 +65,18 @@ TRANSCRIPTS_DIR = ARCHIVE_DIR / "transcripts"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 REPORTS_DIR = ARCHIVE_DIR / "reports"
 DB_PATH = ARCHIVE_DIR / "usage.db"
+CATCHUP_SCHEDULE_FILE = ARCHIVE_DIR / "usage-catchup-schedule.json"   # PR-25: catch-up runs
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2          # 2 adds usage_rollup (PR-25)
 HASH_WINDOW = 4096          # bytes hashed at each end of the ingested prefix (as session_archive_v2)
 COMMIT_EVERY = 200          # changed transcripts per transaction
 BUSY_TIMEOUT_MS = 60000
 SCHEMA_RUNS = 0             # how often create_schema() actually ran in this process (tests read it)
+COOLDOWN_SECONDS = 6 * 3600     # catch-up: at most one run per 6 hours (as api_repair_v2)
+MAX_CATCHUP_PER_DAY = 4         # catch-up: and at most 4 runs in 24 hours
+CATCHUP_LOCK_NAME = ".usage-catchup.lock"
+MIGRATE_LOCK_NAME = ".usage-migrate.lock"
+NEEDS_MIGRATE_LINE = "[usage-db] needs migrate: run usage_db_v2.py migrate (detached) first"
 
 # USD per 1,000,000 tokens. Copied exactly from usage_db.py SEED_PRICING.
 SEED_PRICING = [
@@ -99,6 +111,21 @@ WINNER_SQL = (f"SELECT {_EVENT_COLS} FROM usage_events WHERE session_id=? AND me
 DEDUP_PUT_SQL = (f"INSERT OR REPLACE INTO usage_dedup ({_EVENT_COLS}) "
                  f"VALUES ({_EVENT_PH})")
 DEDUP_DEL_SQL = "DELETE FROM usage_dedup WHERE session_id=? AND message_id=?"
+# usage_rollup (PR-25): tokens and message counts per (session, date, model), summed from
+# usage_dedup. No cost column: cost stays computed at query time from model_pricing (5.4).
+ROLLUP_COLUMNS = ["messages", "input_tokens", "output_tokens", "cache_creation_tokens",
+                  "cache_read_tokens", "ephemeral_5m_tokens", "ephemeral_1h_tokens", "total_tokens"]
+_ROLLUP_SELECT = ("COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(cache_creation_tokens), "
+                  "SUM(cache_read_tokens), SUM(ephemeral_5m_tokens), SUM(ephemeral_1h_tokens), "
+                  "SUM(total_tokens)")
+_ROLLUP_COLS = "session_id, date, model, " + ", ".join(ROLLUP_COLUMNS)
+ROLLUP_DELETE_SQL = "DELETE FROM usage_rollup WHERE session_id=?"
+ROLLUP_PUT_SQL = (f"INSERT INTO usage_rollup ({_ROLLUP_COLS}) "
+                  f"SELECT ?, date, model, {_ROLLUP_SELECT} FROM usage_dedup "
+                  f"WHERE session_id=? GROUP BY date, model")
+ROLLUP_ALL_SQL = (f"INSERT INTO usage_rollup ({_ROLLUP_COLS}) "
+                  f"SELECT session_id, date, model, {_ROLLUP_SELECT} FROM usage_dedup "
+                  f"GROUP BY session_id, date, model")
 STATE_UPSERT_SQL = """INSERT INTO ingest_state
     (source_file, mtime_ns, size, rows_seen, ingested_at, byte_offset, head_sha, tail_sha)
     VALUES (?,?,?,?,?,?,?,?)
@@ -191,6 +218,20 @@ DDL_STATEMENTS = [
     size        INTEGER,
     rows_seen   INTEGER,
     ingested_at TEXT
+)""",
+    """CREATE TABLE IF NOT EXISTS usage_rollup (
+    session_id            TEXT NOT NULL,
+    date                  TEXT NOT NULL,
+    model                 TEXT NOT NULL,
+    messages              INTEGER NOT NULL,
+    input_tokens          INTEGER,
+    output_tokens         INTEGER,
+    cache_creation_tokens INTEGER,
+    cache_read_tokens     INTEGER,
+    ephemeral_5m_tokens   INTEGER,
+    ephemeral_1h_tokens   INTEGER,
+    total_tokens          INTEGER,
+    PRIMARY KEY (session_id, date, model)
 )""",
     "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER)",
 ]
@@ -423,6 +464,8 @@ def create_schema(conn) -> bool:
         conn.executemany("INSERT OR IGNORE INTO model_pricing VALUES (?,?,?,?,?,?)", SEED_PRICING)
         if prev < 1:                          # first build of this file, or a usage_db.py file
             _rebuild_dedup_all(conn)
+        if prev < 2:                          # usage_rollup, filled from usage_dedup (PR-25)
+            _rebuild_rollup_all(conn)
         conn.execute("DELETE FROM schema_version")
         conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
         conn.execute("COMMIT")
@@ -609,10 +652,28 @@ def _refresh_message(conn, sid: str, mid: str) -> None:
         conn.execute(DEDUP_PUT_SQL, row)
 
 
-def _flush_dirty(conn, dirty: set) -> None:
+def _flush_dirty(conn, dirty: set, rollup: bool = True, rollup_sids=None) -> None:
+    """Refresh usage_dedup for every dirty message, then usage_rollup for every session those
+    messages belong to (all dirty session ids, unless rollup_sids names them). Same transaction."""
     for sid, mid in sorted(dirty):
         _refresh_message(conn, sid, mid)
+    if rollup:
+        sids = {sid for sid, _ in dirty} if rollup_sids is None else set(rollup_sids)
+        for sid in sorted(sids):
+            _refresh_rollup(conn, sid)
     dirty.clear()
+
+
+def _refresh_rollup(conn, sid: str) -> None:
+    """Rebuild one session's rows of usage_rollup from usage_dedup."""
+    conn.execute(ROLLUP_DELETE_SQL, (sid,))
+    conn.execute(ROLLUP_PUT_SQL, (sid, sid))
+
+
+def _rebuild_rollup_all(conn) -> None:
+    """usage_rollup from scratch, from usage_dedup. Used on migration and at the end of build."""
+    conn.execute("DELETE FROM usage_rollup")
+    conn.execute(ROLLUP_ALL_SQL)
 
 
 def _rebuild_dedup_all(conn) -> None:
@@ -637,13 +698,25 @@ def _old_keys(conn, uuids: list) -> set:
     return keys
 
 
-def _ingest_one(conn, rel: str, path: Path, st, prev, full: bool, dirty: set) -> int:
+def _source_label(key: str) -> str:
+    """source_file of the rows read for this session file (PR-25 decision 1). It names the live
+    transcript whenever one exists, whichever copy is read, and the mirror path only when no live
+    file exists. The state key (with '|live') is unchanged; only the recorded source is fixed."""
+    base = key.split("|")[0]
+    live = PROJECTS_DIR / base
+    if "acompact" not in str(live) and live.is_file():
+        return base + "|live"
+    return base
+
+
+def _ingest_one(conn, rel: str, path: Path, st, prev, full: bool, dirty: set,
+                save_state: bool = True) -> int:
     start = None
     if not full and prev is not None:
         start = _resume_offset(path, st.st_size, prev)
     if start is None:
         start = 0
-    rows, new_off = scan(path, start, st.st_size, rel)
+    rows, new_off = scan(path, start, st.st_size, _source_label(rel))
     if rows:
         # Every message whose winner can change: the new keys, and the keys these uuids
         # held before the upsert (an upsert may move a uuid to another message).
@@ -651,8 +724,9 @@ def _ingest_one(conn, rel: str, path: Path, st, prev, full: bool, dirty: set) ->
         dirty.update(_old_keys(conn, [r[0] for r in rows]))
         conn.executemany(INSERT_SQL, rows)
     head_sha, tail_sha = _checksums(path, new_off)
-    conn.execute(STATE_UPSERT_SQL, (rel, st.st_mtime_ns, st.st_size, len(rows), _now(),
-                                    new_off, head_sha, tail_sha))
+    if save_state:
+        conn.execute(STATE_UPSERT_SQL, (rel, st.st_mtime_ns, st.st_size, len(rows), _now(),
+                                        new_off, head_sha, tail_sha))
     return len(rows)
 
 
@@ -666,26 +740,8 @@ def ingest(full: bool = False) -> int:
         if full:
             conn.execute("DELETE FROM usage_dedup")
             conn.execute("DELETE FROM ingest_state")
-        state = {} if full else _load_state(conn)
-        dirty = set()
-        for rel, path in sources():
-            files += 1
-            try:
-                st = path.stat()
-            except OSError:
-                continue
-            prev = state.get(rel)
-            if prev is not None and prev["mtime_ns"] == st.st_mtime_ns and prev["size"] == st.st_size:
-                continue
-            changed += 1
-            total_rows += _ingest_one(conn, rel, path, st, prev, full, dirty)
-            if changed % COMMIT_EVERY == 0:
-                _flush_dirty(conn, dirty)
-                conn.execute("COMMIT")
-                conn.execute("BEGIN IMMEDIATE")
-        _flush_dirty(conn, dirty)
-        if full:
-            _rebuild_dedup_all(conn)
+            conn.execute("DELETE FROM usage_rollup")
+        files, changed, total_rows = _run_sources(conn, sources(), full)
         conn.execute("COMMIT")
         n = conn.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0]
     except BaseException:
@@ -697,6 +753,230 @@ def ingest(full: bool = False) -> int:
     print(f"[usage-db] scanned {files} transcripts, {changed} changed, "
           f"{total_rows} rows upserted; {n} events in db")
     return 0
+
+
+def _run_sources(conn, entries, full: bool, save_state: bool = True, rollup_sids=None):
+    """The per-source loop of sync, build, session and catch-up. The caller holds BEGIN IMMEDIATE
+    and issues the final COMMIT. Commits every COMMIT_EVERY changed sources, as before."""
+    files = changed = total_rows = 0
+    state = {} if full else _load_state(conn)
+    dirty = set()
+    for rel, path in entries:
+        files += 1
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        prev = state.get(rel)
+        if prev is not None and prev["mtime_ns"] == st.st_mtime_ns and prev["size"] == st.st_size:
+            continue
+        changed += 1
+        total_rows += _ingest_one(conn, rel, path, st, prev, full, dirty, save_state)
+        if changed % COMMIT_EVERY == 0:
+            _flush_dirty(conn, dirty, rollup=not full, rollup_sids=rollup_sids)
+            conn.execute("COMMIT")
+            conn.execute("BEGIN IMMEDIATE")
+    _flush_dirty(conn, dirty, rollup=not full, rollup_sids=rollup_sids)
+    if full:
+        _rebuild_dedup_all(conn)
+        _rebuild_rollup_all(conn)
+    return files, changed, total_rows
+
+
+# ---------------------------------------------------------------- PR-25: session close, catch-up
+
+def _take_lock(lock: Path) -> bool:
+    """Single-run lock by O_EXCL file, as cmd_export. A lock older than 600 s is stale."""
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(2):
+        try:
+            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0))
+        except FileExistsError:
+            try:
+                age = time.time() - lock.stat().st_mtime
+            except OSError:
+                age = 0
+            if age < 600:
+                return False
+            lock.unlink(missing_ok=True)
+            continue
+        except PermissionError:                # on Windows, busy right after an unlink
+            return False
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return True
+    return False
+
+
+def _open_ready():
+    """Open usage.db for a session step or catch-up. Never creates or migrates the schema.
+    Returns None (after one line) when the file is missing or below SCHEMA_VERSION."""
+    if not DB_PATH.exists():
+        print(NEEDS_MIGRATE_LINE)
+        return None
+    conn = sqlite3.connect(str(DB_PATH), timeout=BUSY_TIMEOUT_MS / 1000, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    if _schema_version(conn) < SCHEMA_VERSION:
+        conn.close()
+        print(NEEDS_MIGRATE_LINE)
+        return None
+    return conn
+
+
+def _tree_rel(path):
+    """The path relative to PROJECTS_DIR or TRANSCRIPTS_DIR (the first that holds it), or None."""
+    p = Path(os.path.abspath(str(path)))
+    for base in (PROJECTS_DIR, TRANSCRIPTS_DIR):
+        try:
+            return p.relative_to(Path(os.path.abspath(str(base))))
+        except ValueError:
+            continue
+    return None
+
+
+def _entries_for(rels) -> list:
+    """(key, path) pairs for these relative paths, with the same keys as sources(): the mirror
+    copy, the live copy when there is no mirror copy, and 'rel|live' when the live copy is bigger.
+    Live paths containing 'acompact' are skipped, as sources() does."""
+    out = []
+    for rel in rels:
+        mirror = TRANSCRIPTS_DIR / rel
+        live = PROJECTS_DIR / rel
+        has_mirror = mirror.is_file()
+        if has_mirror:
+            out.append((str(rel), mirror))
+        if live.is_file() and "acompact" not in str(live):
+            if not has_mirror:
+                out.append((str(rel), live))
+            else:
+                try:
+                    if live.stat().st_size > mirror.stat().st_size:
+                        out.append((str(rel) + "|live", live))
+                except OSError:
+                    pass
+    return out
+
+
+def session_files(transcript_path, session_id: str):
+    """The sources of one session, found from its transcript path (no walk of the tree): the main
+    transcript and every file under <slug>/<session_id>/subagents/ in either tree. None when the
+    path is outside the tree or the transcript is missing (the catch-up covers it)."""
+    rel = _tree_rel(transcript_path)
+    if rel is None or not session_id:
+        return None
+    if not ((TRANSCRIPTS_DIR / rel).is_file() or (PROJECTS_DIR / rel).is_file()):
+        return None
+    sub = rel.parent / session_id / "subagents"
+    rels = {rel}
+    for base in (TRANSCRIPTS_DIR, PROJECTS_DIR):
+        d = base / sub
+        if d.is_dir():
+            rels.update(p.relative_to(base) for p in d.rglob("*.jsonl") if p.is_file())
+    return _entries_for(sorted(rels, key=str))
+
+
+def ingest_session(transcript_path, session_id: str) -> int:
+    """Session close (one bounded step): read the session's appended bytes, one transaction.
+    Exit 0 when done or skipped; 1 when the schema needs migrate. Never migrates."""
+    entries = session_files(transcript_path, session_id)
+    if entries is None:
+        print(f"[usage-db] session {session_id}: transcript not in the tree, skipped "
+              f"(catch-up covers it)")
+        return 0
+    conn = _open_ready()
+    if conn is None:
+        return 1
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        files, changed, total_rows = _run_sources(conn, entries, full=False, save_state=True)
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+    print(f"[usage-db] session {session_id}: scanned {files} files, {changed} changed, "
+          f"{total_rows} rows upserted")
+    return 0
+
+
+def _epoch_now() -> float:
+    return time.time()
+
+
+def _catchup_gate(now: float):
+    runs = _catchup_runs()
+    last = max(runs, default=0)
+    if now - last < COOLDOWN_SECONDS:
+        nxt = time.strftime("%H:%M", time.localtime(last + COOLDOWN_SECONDS))
+        return False, f"cooldown: the next catch-up is allowed at {nxt}"
+    if sum(1 for t in runs if now - t < 86400) >= MAX_CATCHUP_PER_DAY:
+        return False, f"{MAX_CATCHUP_PER_DAY} catch-ups already ran in the last 24 hours"
+    return True, ""
+
+
+def _catchup_runs() -> list:
+    return guardkit.load_json(CATCHUP_SCHEDULE_FILE, {}).get("runs", [])
+
+
+def catch_up(bypass_cooldown: bool = False) -> int:
+    """Every source, incremental: for sessions whose close never ran. At most one run per
+    COOLDOWN_SECONDS and MAX_CATCHUP_PER_DAY per 24 h, unless bypass_cooldown (tests)."""
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = ARCHIVE_DIR / CATCHUP_LOCK_NAME
+    if not _take_lock(lock):
+        print("[usage-db] catch-up already running; skipping")
+        return 0
+    try:
+        now = _epoch_now()
+        if not bypass_cooldown:
+            ok, why = _catchup_gate(now)
+            if not ok:
+                print(f"[usage-db] catch-up skipped: {why}")
+                return 0
+        conn = _open_ready()
+        if conn is None:
+            return 1
+        try:
+            runs = [t for t in _catchup_runs() if now - t < 7 * 86400]
+            guardkit.atomic_write_json(CATCHUP_SCHEDULE_FILE, {"runs": runs + [now]})
+            conn.execute("BEGIN IMMEDIATE")
+            files, changed, total_rows = _run_sources(conn, sources(), full=False)
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+        print(f"[usage-db] catch-up: scanned {files} transcripts, {changed} changed, "
+              f"{total_rows} rows upserted")
+        return 0
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def migrate() -> int:
+    """Create or migrate the schema. Meant to run detached, once, before any session step. The
+    schema is created by create_schema under BEGIN IMMEDIATE, so the SQLite write lock holds it."""
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = ARCHIVE_DIR / MIGRATE_LOCK_NAME
+    if not _take_lock(lock):
+        print("[usage-db] migrate already running; skipping")
+        return 0
+    try:
+        conn = _connect_rw()
+        try:
+            version = _schema_version(conn)
+        finally:
+            conn.close()
+        print(f"[usage-db] schema version {version}")
+        return 0
+    finally:
+        lock.unlink(missing_ok=True)
 
 
 # Output CSVs: view -> file name. Same list and file names as usage_db.py CSV_EXPORTS.
@@ -881,6 +1161,14 @@ def main() -> int:
         except sqlite3.Error as e:
             print(f"[usage-db] sql failed: {e}"); return 1
         return 0
+    if mode == "migrate":
+        return migrate()
+    if mode == "catch-up":
+        return catch_up()
+    if mode == "session":
+        if len(argv) < 4:
+            print("usage: usage_db_v2.py session <transcript_path> <session_id>"); return 1
+        return ingest_session(argv[2], argv[3])
     if mode == "schema":
         try:
             conn = _connect_ro()
