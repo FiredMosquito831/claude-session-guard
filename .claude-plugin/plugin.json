@@ -1,7 +1,7 @@
 {
-  "name": "claude-session-guard",
+  "name": "session-guard",
   "displayName": "Claude Session Guard",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Keeps Claude Code sessions persistent, self-repairing and always resumable. Mirrors every transcript to an append-only archive, auto-fixes the corruption that makes `claude --resume` fail, and keeps a queryable SQLite store of token usage with CSV rollups.",
   "author": {
     "name": "Eduard Secureanu",

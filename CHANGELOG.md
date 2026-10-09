@@ -16,6 +16,10 @@ These changes are in the repository and tested. The hooks in `hooks/hooks.json` 
 
 Known limits: a rewrite confined to the middle of an indexed prefix is not detected; the 2026-10-07 and 2026-10-09 usage totals are not reconciled; prices are unverified; the skills (`usage-report`, `session-doctor`) describe the 1.4.0 tools until the v2 tools are wired.
 
+### Changed
+
+- Plugin renamed to `session-guard`. The name `claude-session-guard` is reserved by Claude Code plugin validation, and `claude plugin validate . --strict` failed on it. Install with `/plugin install session-guard@claude-session-guard`. Manifests set to 1.4.1.
+
 ## 1.4.0
 
 - Renamed to **claude-session-guard** (was session-vault); the `vault-doctor`
