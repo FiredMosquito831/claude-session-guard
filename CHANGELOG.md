@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased (staged, not wired into hooks)
+
+These changes are in the repository and tested. The hooks in `hooks/hooks.json` still run the 1.4.0 scripts. The new modules are wired only after a separate, approved change to the settings.
+
+- `scripts/guardkit.py`: shared helpers. Lock with a takeover marker (stale locks are taken over under that marker), binary atomic writes, raw line reader, a checkpointed clean-file cache, the shared locked writer for the removed-lines archive, and a payload reader.
+- `scripts/api_repair_v2.py`: repair with the write order fixed (concurrent-append check before backup, archive and replace), an idempotent lossless archive, and a SessionEnd guard that skips a session still running.
+- `scripts/session_archive_v2.py`: an append-only mirror with per-transcript offsets, binary writes, and a crash path that quarantines bytes before truncating. Restore never rewrites a live file without `--merge-live`. The canary classes missing lines as excused, excused by unreadable record, or unexplained, and exits 1 when any are unexplained.
+- `scripts/session_indexer_v2.py`: prompt index merge that only appends, under a lock, and refuses a rewritten history. `register` uses the SessionStart payload.
+- `scripts/usage_db_v2.py`: incremental usage store with a `usage_dedup` table, export separate from sync, and read-only SQL.
+- `scripts/jsonl_repair_v2.py`: archive before replace, exact bytes, blank lines archived, subagent transcripts included, incremental sweep on a pool of 8 with a 6 h / 4 per 24 h gate.
+- `scripts/guard_hook.py`: one dispatcher per hook event, with per-step deadlines and detached repair sweeps.
+- `scripts/run.sh`: caches the interpreter path, so a hook call starts Python once on a cache hit.
+- `tools/deploy.py`: copies an allowlist of scripts to a target folder. Dry run by default; runs the tests first.
+
+Known limits: a rewrite confined to the middle of an indexed prefix is not detected; the 2026-10-07 and 2026-10-09 usage totals are not reconciled; prices are unverified; the skills (`usage-report`, `session-doctor`) describe the 1.4.0 tools until the v2 tools are wired.
+
 ## 1.4.0
 
 - Renamed to **claude-session-guard** (was session-vault); the `vault-doctor`
