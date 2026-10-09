@@ -30,7 +30,6 @@ Safety
   * Each repaired file's append offsets are invalidated, so the archive and usage
     syncs re-read it in full next time.
 """
-import hashlib
 import json
 import os
 import re
@@ -50,7 +49,7 @@ ACTIVE_SKIP_SECONDS = 3600
 COOLDOWN_SECONDS = 6 * 3600
 MAX_SWEEPS_PER_DAY = 4
 SCHEDULE_FILE = gk.STATE_DIR / "api_repair_schedule.json"
-INDEX_READ_BLOCK = 8 * 1024 * 1024       # the removed-lines index streams the archive in blocks this size
+INDEX_READ_BLOCK = 8 * 1024 * 1024       # read block for the archive index (passed to gk.append_removed_records)
 
 # Superset of every thinking value that can be empty or whitespace-only (or null):
 #   "thinking": ""   "thinking": "\n\n"   "thinking": " "   "thinking": null
@@ -175,90 +174,6 @@ def make_backup(path: Path) -> Path:
     return dest
 
 
-def _index_paths():
-    """The digest index of the removed-lines archive, kept in the state folder."""
-    return gk.STATE_DIR / "removed_index.json", gk.STATE_DIR / "removed_index.bin"
-
-
-def _record_digest(source_file: str, content: str) -> bytes:
-    """16-byte identity of one archived record: its source file and its exact content."""
-    key = source_file.encode("utf-8", "surrogateescape") + b"\0" + content.encode("utf-8", "surrogateescape")
-    return hashlib.blake2b(key, digest_size=16).digest()
-
-
-def _refresh_removed_index() -> set:
-    """Index the archive records written since the last refresh, and return every known digest.
-
-    Call with the archive lock held. Only complete lines are read. The new digests are appended to
-    removed_index.bin and synced before the offset is recorded in removed_index.json. If the archive
-    is smaller than the recorded offset, it was truncated or replaced, so the index is rebuilt.
-    """
-    idx_json, idx_bin = _index_paths()
-    state = gk.load_json(idx_json, None)
-    offset = state.get("archive_offset") if isinstance(state, dict) else None
-    try:
-        archive_size = REMOVED_LINES_ARCHIVE.stat().st_size
-    except FileNotFoundError:
-        archive_size = 0
-    rebuild = not isinstance(offset, int) or offset < 0 or archive_size < offset
-    if rebuild:
-        if isinstance(offset, int) and offset > archive_size:
-            msg = (f"removed-lines archive is smaller than its index ({archive_size} < {offset} bytes); "
-                   "index rebuilt from the start")
-            print("[api-repair] warning: " + msg, file=sys.stderr)
-            gk.log_line("api_repair", "warning: " + msg)
-        offset = 0
-    new, bad, consumed = [], 0, offset      # consumed: archive offset through the last complete line
-    try:
-        f = open(REMOVED_LINES_ARCHIVE, "rb")
-    except FileNotFoundError:
-        f = None
-    if f is not None:
-        with f:
-            f.seek(offset)
-            carry = b""
-            while True:
-                block = f.read(INDEX_READ_BLOCK)  # streamed: the real archive is about 2 GB
-                if not block:
-                    break
-                buf = carry + block
-                cut = buf.rfind(b"\n") + 1
-                if cut == 0:
-                    carry = buf
-                    continue
-                for raw_line in buf[:cut].split(b"\n"):
-                    if not raw_line.strip():
-                        continue
-                    try:
-                        rec = json.loads(raw_line.decode("utf-8", "surrogateescape"))
-                    except ValueError:
-                        bad += 1
-                        continue
-                    if not isinstance(rec, dict) or not isinstance(rec.get("source_file"), str) \
-                            or not isinstance(rec.get("content"), str):
-                        bad += 1
-                        continue
-                    new.append(_record_digest(rec["source_file"], rec["content"]))
-                consumed += cut
-                carry = buf[cut:]
-    if bad:
-        gk.log_line("api_repair", f"removed-lines archive: {bad} unreadable record(s) skipped while indexing")
-    idx_bin.parent.mkdir(parents=True, exist_ok=True)
-    with open(idx_bin, "a+b") as f:
-        size = f.seek(0, os.SEEK_END)
-        keep = 0 if rebuild else size // 16 * 16  # drop a partial digest left by a killed write
-        if keep != size:
-            f.truncate(keep)
-        if new:
-            f.write(b"".join(new))
-        f.flush()
-        os.fsync(f.fileno())
-        f.seek(0)
-        data = f.read()
-    gk.atomic_write_json(idx_json, {"archive_offset": consumed})
-    return {data[i:i + 16] for i in range(0, len(data) // 16 * 16, 16)}
-
-
 def _unlink_quiet(path: Path) -> None:
     try:
         path.unlink()
@@ -269,46 +184,12 @@ def _unlink_quiet(path: Path) -> None:
 def archive_dropped(path: Path, dropped) -> tuple:
     """Append each removed record to the permanent archive, once. Returns (written, skipped).
 
-    A record is identified by its source file and its exact content, so a record already in the
-    archive is skipped. Content is written as surrogateescape bytes, so invalid UTF-8 is kept
-    byte for byte. The archive lock is held from the index check to the last write.
+    Thin wrapper over gk.append_removed_records (PR-09). The archive path and the index read block
+    are passed in, so a test that sets REMOVED_LINES_ARCHIVE or INDEX_READ_BLOCK on this module still applies.
     """
-    BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().isoformat()
-    lock = gk.lock_wait("removed-lines-archive", timeout=60)
-    if lock is None:
-        raise RuntimeError("the removed-lines archive is locked by another process")
-    try:
-        known = _refresh_removed_index()
-        source = str(path)
-        written = skipped = 0
-        new_digests, offset = [], None
-        with open(REMOVED_LINES_ARCHIVE, "ab") as f:
-            for lineno, reason, content in dropped:
-                digest = _record_digest(source, content)
-                if digest in known:
-                    skipped += 1
-                    continue
-                rec = {"archived_at": stamp, "source_file": source, "source_line": lineno,
-                       "reason": reason, "content": content}
-                f.write(json.dumps(rec, ensure_ascii=False).encode("utf-8", "surrogateescape") + b"\n")
-                known.add(digest)
-                new_digests.append(digest)
-                written += 1
-            f.flush()
-            os.fsync(f.fileno())
-            if written:
-                offset = f.tell()                 # our own last write; never a stat, others may append
-        if new_digests:
-            idx_json, idx_bin = _index_paths()
-            with open(idx_bin, "ab") as f:
-                f.write(b"".join(new_digests))
-                f.flush()
-                os.fsync(f.fileno())
-            gk.atomic_write_json(idx_json, {"archive_offset": offset})
-        return written, skipped
-    finally:
-        lock.release()
+    records = [{"source_file": str(path), "source_line": lineno, "reason": reason, "content": content}
+               for lineno, reason, content in dropped]
+    return gk.append_removed_records(records, archive=REMOVED_LINES_ARCHIVE, read_block=INDEX_READ_BLOCK)
 
 
 def _changed(path: Path, st) -> bool:
