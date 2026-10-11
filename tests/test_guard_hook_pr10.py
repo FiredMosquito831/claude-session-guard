@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 PR-10 tests for scripts/guard_hook.py. Every test writes only under a fresh temporary
-SESSION_GUARD_HOME. The detached launcher, the Popen and run calls, and the register step are
-monkeypatched where a real child would start a sweep or touch data. No real hook runs.
+SESSION_GUARD_HOME. In the SessionStart test the Popen and run calls and the register step are
+monkeypatched, so the detached launches are only recorded. The Stop and SessionEnd tests run the
+detached archive and repair for real, in the temporary home, and wait for each one to exit.
 
 Run: python -I tests\\test_guard_hook_pr10.py
 Each check prints PASS <name> or FAIL <name>: <reason>. Exit 0 only when every check passes.
@@ -21,6 +22,8 @@ from pathlib import Path
 
 HOME = tempfile.mkdtemp(prefix="pr10_guard_hook_home_")
 os.environ["SESSION_GUARD_HOME"] = HOME      # set before any plugin code is imported
+os.environ["HOME"] = HOME                    # session_detect reads Path.home(); keep it in the temporary home
+os.environ["USERPROFILE"] = HOME
 
 HERE = Path(__file__).resolve().parent
 SCRIPTS = HERE.parent / "scripts"
@@ -57,6 +60,17 @@ def patched(obj, attr, value):
         yield
     finally:
         setattr(obj, attr, old)
+
+
+def wait_detached(name: str, timeout: float = 120.0) -> None:
+    """Wait until the detached child launched under this name has exited. Its pid is in the state file."""
+    state = Path(guardkit.STATE_DIR) / f"detached-{name}.json"
+    pid = int(json.loads(state.read_text(encoding="utf-8"))["pid"])
+    deadline = time.monotonic() + timeout
+    while guard_hook._pid_alive(pid):
+        if time.monotonic() > deadline:
+            raise AssertionError(f"detached {name} still running after {timeout:g} s")
+        time.sleep(0.2)
 
 
 def jline(n: int) -> bytes:
@@ -128,22 +142,27 @@ def test_session_start_order_and_detach():
             patched(subprocess, "Popen", fake_popen), patched(subprocess, "run", fake_run):
         line = guard_hook.run_event("SessionStart", payload)
 
-    assert [c[0] for c in calls] == ["register", "popen"], f"call order was {[c[0] for c in calls]}"
+    assert [c[0] for c in calls] == ["register", "run", "popen", "popen", "popen", "popen"], \
+        f"call order was {[c[0] for c in calls]}"
     assert calls[0][1]["session_id"] == "s-start", "register did not get the payload"
-    popen_args, popen_kw = calls[1][1], calls[1][2]
-    assert "api_repair_v2.py" in popen_args[1] and popen_args[2:] == ["fix", "--all"], \
-        f"sweep args were {popen_args}"
-    assert popen_kw.get("stdin") == subprocess.DEVNULL, "sweep stdin is not DEVNULL"
-    if os.name == "nt":
-        flags = 0x00000008 | 0x00000200 | 0x08000000
-        assert popen_kw.get("creationflags") == flags, f"creationflags {popen_kw.get('creationflags')}"
-        assert "start_new_session" not in popen_kw, "POSIX flag set on Windows"
-    else:
-        assert popen_kw.get("start_new_session") is True, "start_new_session not set"
+    assert calls[1][1][-1].endswith("session_detect.py"), f"detect args were {calls[1][1]}"
+    launches = [(c[1], c[2]) for c in calls if c[0] == "popen"]
+    got = [Path(a[1]).name + " " + " ".join(a[2:]) for a, _kw in launches]
+    assert got == ["session_indexer_v2.py scan", "session_archive_v2.py sync",
+                   "api_repair_v2.py fix --all", "usage_db_v2.py catch-up"], f"detached launches were {got}"
+    for popen_args, popen_kw in launches:
+        assert popen_kw.get("stdin") == subprocess.DEVNULL, "a detached step's stdin is not DEVNULL"
+        if os.name == "nt":
+            flags = 0x00000008 | 0x00000200 | 0x08000000
+            assert popen_kw.get("creationflags") == flags, f"creationflags {popen_kw.get('creationflags')}"
+            assert "start_new_session" not in popen_kw, "POSIX flag set on Windows"
+        else:
+            assert popen_kw.get("start_new_session") is True, "start_new_session not set"
     state = Path(guardkit.STATE_DIR) / "detached-sweep-api_repair.json"
     assert state.is_file(), "detached state file was not written"
     assert json.loads(state.read_text(encoding="utf-8"))["pid"] == 4242, "state file has the wrong pid"
-    assert line.startswith("[guard] SessionStart: register=ok sweep=ok total="), line
+    assert line.startswith("[guard] SessionStart: register=ok detect=ok scan=ok archive=ok "
+                           "sweep_api=ok usage=ok total="), line
 
 
 def test_stop_scoped_to_transcript():
@@ -160,6 +179,7 @@ def test_stop_scoped_to_transcript():
     before_b = arch_b.read_bytes()
     line = guard_hook.run_event("Stop", {"session_id": "sessA", "transcript_path": str(a)})
     assert "archive=ok" in line, line
+    wait_detached("archive-transcript")
     assert jline(2) in arch_a.read_bytes(), "the new line of transcript A was not archived"
     assert arch_b.read_bytes() == before_b, "the archive of transcript B changed"
 
@@ -167,35 +187,64 @@ def test_stop_scoped_to_transcript():
 def test_step_failure_is_isolated():
     reset_home()
     a = make_transcript("slugC/sessC.jsonl", [jline(5)])
+    payload = {"session_id": "sessC", "transcript_path": str(a)}
+    launched = []
 
-    def boom(payload):
+    def fake_launch(args, log_path, name=None):
+        launched.append(name)
+        return 1
+
+    def boom_index(payload):
+        raise RuntimeError("boom in index")
+
+    def boom_archive(payload):
         raise RuntimeError("boom in archive")
 
+    # A failing index step is recorded, and the archive step after it still runs.
     out = io.StringIO()
-    with patched(guard_hook, "step_archive", boom), contextlib.redirect_stdout(out):
-        rc = guard_hook.main(["Stop"], payload={"session_id": "sessC", "transcript_path": str(a)})
+    with patched(guard_hook, "step_index", boom_index), patched(guard_hook, "launch_detached", fake_launch), \
+            contextlib.redirect_stdout(out):
+        rc = guard_hook.main(["Stop"], payload=payload)
+    assert rc == 0, f"exit code {rc}"
+    lines = out.getvalue().splitlines()
+    assert len(lines) == 1, f"stdout has {len(lines)} lines"
+    assert "index=fail" in lines[0] and "archive=ok" in lines[0], f"later step did not run: {lines[0]}"
+    assert launched == ["archive-transcript"], f"detached launches were {launched}"
+    log = (Path(guardkit.LOG_DIR) / "guard_hook.log").read_text(encoding="utf-8")
+    assert "Stop index: fail: RuntimeError: boom in index" in log, "the index failure was not logged"
+
+    # A failing archive step is recorded, and the index step before it still ran.
+    out = io.StringIO()
+    with patched(guard_hook, "step_archive", boom_archive), contextlib.redirect_stdout(out):
+        rc = guard_hook.main(["Stop"], payload=payload)
     assert rc == 0, f"exit code {rc}"
     lines = out.getvalue().splitlines()
     assert len(lines) == 1, f"stdout has {len(lines)} lines"
     assert "archive=fail" in lines[0], lines[0]
-    assert "index=ok" in lines[0] and "usage=ok" in lines[0], f"later steps did not run: {lines[0]}"
+    assert "index=ok" in lines[0], f"earlier step did not run: {lines[0]}"
     log = (Path(guardkit.LOG_DIR) / "guard_hook.log").read_text(encoding="utf-8")
     assert "Stop archive: fail: RuntimeError: boom in archive" in log, "the failure was not logged"
 
 
 def test_timeout_is_recorded():
     reset_home()
+    launched = []
 
-    def slow_archive(payload):
+    def fake_launch(args, log_path, name=None):
+        launched.append(name)
+        return 1
+
+    def slow_index(payload):
         guard_hook.run_tool("sleeping child", ["-c", "import time; time.sleep(30)"], 0.5)
         return "ok"
 
     t0 = time.perf_counter()
-    with patched(guard_hook, "step_archive", slow_archive):
-        line = guard_hook.run_event("Stop", {})
+    with patched(guard_hook, "step_index", slow_index), patched(guard_hook, "launch_detached", fake_launch):
+        line = guard_hook.run_event("Stop", {"transcript_path": "unused"})
     elapsed = time.perf_counter() - t0
-    assert "archive=timeout" in line, line
-    assert "usage=ok" in line and "index=ok" in line, f"later steps did not run: {line}"
+    assert "index=timeout" in line, line
+    assert "archive=ok" in line, f"the step after the timeout did not run: {line}"
+    assert launched == ["archive-transcript"], f"detached launches were {launched}"
     assert elapsed < 20, f"the deadline did not stop the child: {elapsed:.1f}s"
 
 
@@ -206,6 +255,7 @@ def test_session_end_passes_reason():
     line = guard_hook.run_event("SessionEnd", {"session_id": "sessE", "transcript_path": str(t),
                                                "cwd": "unused", "end_reason": "resume"})
     assert line.startswith("[guard] SessionEnd: repair=ok "), line
+    wait_detached("repair-from-hook")
     assert t.read_bytes() == before, "the transcript was changed although the session resumes"
     log = (Path(guardkit.LOG_DIR) / "api_repair.log").read_text(encoding="utf-8")
     assert "from-hook end_reason=resume" in log and "skipped" in log, "end_reason was not passed through"
@@ -223,6 +273,7 @@ def test_session_end_reason_resume_skips():
     line = out.getvalue()
     assert rc == 0, f"exit code {rc}"
     assert line.startswith("[guard] SessionEnd: repair=ok "), line
+    wait_detached("repair-from-hook")
     assert t.read_bytes() == before, "the transcript was changed although the session resumes (reason)"
     log = (Path(guardkit.LOG_DIR) / "api_repair.log").read_text(encoding="utf-8")
     assert "from-hook end_reason=resume" in log and "skipped" in log, "reason was not read by from-hook"
@@ -240,6 +291,7 @@ def test_session_end_reason_clear_repairs():
     line = out.getvalue()
     assert rc == 0, f"exit code {rc}"
     assert line.startswith("[guard] SessionEnd: repair=ok "), line
+    wait_detached("repair-from-hook")
     assert t.read_bytes() != before, "the transcript was not repaired although the session ended (clear)"
 
 
@@ -256,6 +308,7 @@ def test_session_end_reason_wins_over_end_reason():
     line = out.getvalue()
     assert rc == 0, f"exit code {rc}"
     assert line.startswith("[guard] SessionEnd: repair=ok "), line
+    wait_detached("repair-from-hook")
     assert t.read_bytes() != before, "reason=clear did not win over end_reason=resume"
     log = (Path(guardkit.LOG_DIR) / "api_repair.log").read_text(encoding="utf-8")
     assert "from-hook end_reason=clear" in log, "reason did not take precedence over end_reason"
@@ -273,6 +326,7 @@ def test_session_end_end_reason_fallback():
     line = out.getvalue()
     assert rc == 0, f"exit code {rc}"
     assert line.startswith("[guard] SessionEnd: repair=ok "), line
+    wait_detached("repair-from-hook")
     assert t.read_bytes() == before, "the transcript was changed; end_reason alone must still skip"
     log = (Path(guardkit.LOG_DIR) / "api_repair.log").read_text(encoding="utf-8")
     assert "from-hook end_reason=resume" in log and "skipped" in log, "end_reason fallback was not read"
@@ -288,21 +342,25 @@ def test_no_double_launch():
         launched.append(list(args))
         return 1
 
-    # A lock held by this live test process: the launch must be skipped.
+    def sweeps():
+        return [a for a in launched if "fix" in a]
+
+    # A lock held by this live test process: the sweep launch must be skipped.
     lock.path.write_text(f"{os.getpid()} {time.time()}\n", encoding="utf-8")
     with patched(guard_hook, "launch_detached", fake_launch):
         line = guard_hook.run_event("SessionStart", {"session_id": "s"})
-    assert "sweep=skipped" in line, line
-    assert launched == [], "a second sweep was launched while the lock was held"
+    assert "sweep_api=skipped" in line, line
+    assert sweeps() == [], "a second sweep was launched while the lock was held"
 
-    # A lock whose pid has exited: the launch must go ahead.
+    # A lock whose pid has exited: the sweep launch must go ahead.
+    launched.clear()
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
     dead.wait(timeout=60)
     lock.path.write_text(f"{dead.pid} {time.time()}\n", encoding="utf-8")
     with patched(guard_hook, "launch_detached", fake_launch):
         line = guard_hook.run_event("SessionStart", {"session_id": "s"})
-    assert "sweep=ok" in line, line
-    assert len(launched) == 1, "a sweep was not launched after the lock holder exited"
+    assert "sweep_api=ok" in line, line
+    assert len(sweeps()) == 1, "a sweep was not launched after the lock holder exited"
     assert dead.returncode == 0, f"helper process exit {dead.returncode}"
 
 
@@ -319,6 +377,7 @@ def test_summary_line_format():
         lines = out.splitlines()
         assert len(lines) == 1 and out.endswith("\n"), f"{event}: stdout has {len(lines)} lines"
         assert SUMMARY_RE.match(lines[0]), f"{event}: summary does not match: {lines[0]!r}"
+    wait_detached("repair-from-hook")
 
 
 TESTS = [test_usage_line, test_session_start_order_and_detach, test_stop_scoped_to_transcript,

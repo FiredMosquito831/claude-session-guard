@@ -19,7 +19,7 @@ def check(name, ok, extra=""):
     print(("PASS " if ok else "FAIL ") + name + (f"  {extra}" if extra else ""))
 
 FIX = Path(tempfile.mkdtemp(prefix="deploy_fix_", dir=_HOME))
-NAMES = ["guardkit.py", "api_repair_v2.py", "usage_db_v2.py", "session_archive_v2.py", "jsonl_repair_v2.py", "session_indexer_v2.py", "session_detect.py"]  # PR-29, PR-30, PR-36: the fixture copies every allowlisted script from the repo's scripts folder, which the allowlist needs
+NAMES = ["guardkit.py", "api_repair_v2.py", "usage_db_v2.py", "session_archive_v2.py", "jsonl_repair_v2.py", "session_indexer_v2.py", "session_detect.py", "guard_hook.py"]  # PR-29, PR-30, PR-36: the fixture copies every allowlisted script from the repo's scripts folder, which the allowlist needs
 
 def make_repo(label):
     root = FIX / label
@@ -52,8 +52,8 @@ import importlib.util
 _spec = importlib.util.spec_from_file_location("deploy_under_test", REPO / "tools" / "deploy.py")
 deploy_mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(deploy_mod)
-check("allowlist is exactly the six names, in order",
-      deploy_mod.ALLOWLIST == ["guardkit.py", "api_repair_v2.py", "usage_db_v2.py", "session_archive_v2.py", "jsonl_repair_v2.py", "session_indexer_v2.py", "session_detect.py"],
+check("allowlist is exactly the eight names, in order",
+      deploy_mod.ALLOWLIST == ["guardkit.py", "api_repair_v2.py", "usage_db_v2.py", "session_archive_v2.py", "jsonl_repair_v2.py", "session_indexer_v2.py", "session_detect.py", "guard_hook.py"],
       str(deploy_mod.ALLOWLIST))
 
 # An empty scratch target: a dry run lists usage_db_v2.py as new and exits 0.
