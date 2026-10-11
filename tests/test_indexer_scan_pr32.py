@@ -33,6 +33,7 @@ V1 = SCRIPTS / "session_indexer.py"
 V2 = SCRIPTS / "session_indexer_v2.py"
 GIT_REPO = Path(os.environ.get("PR32_GIT_REPO") or REPO)
 BASE_REF = "3dfa104"
+REGISTER_WAIT_LIMIT = 3.5  # seconds: the register wait is 2 s, plus interpreter start-up
 REAL_PROFILE = Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or Path.home())  # read before the redirect
 PY = sys.executable
 
@@ -609,6 +610,79 @@ def check_throttle_window():
     _fail(problems)
 
 
+def _start_holder(home: Path):
+    """A subprocess that holds the session-index lock until a line is written to its stdin."""
+    return subprocess.Popen([PY, "-I", "-B", "-c", HOLDER_CODE, str(SCRIPTS)], env=_env(home),
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace")
+
+
+def _release_holder(holder) -> int:
+    try:
+        holder.stdin.write("\n")
+        holder.stdin.flush()
+    except OSError:
+        pass
+    try:
+        return holder.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        holder.kill()
+        return -1
+
+
+def check_register_lock_busy():
+    h = make_home(T / "reg-busy")
+    rc, out, err = v2_scan(h)
+    if rc != 0 or "merge ok" not in out:
+        raise AssertionError(f"first scan rc={rc}, output {out.strip()[:160]!r}")
+    # A session that started after the last scan: its transcript is newer than the watermark's cutoff.
+    transcript = _claude(h) / "projects" / "proj-alpha" / "s10.jsonl"
+    _write(transcript, [
+        _user("s10", "2026-10-10T12:00:00Z", "backfill prompt one"),
+        _user("s10", "2026-10-10T12:00:01Z", "backfill prompt two"),
+    ])
+    payload = json.dumps({"session_id": "s10", "transcript_path": str(transcript),
+                          "hook_event_name": "SessionStart", "source": "resume"})
+    backfill = [("s10", _ms("2026-10-10T12:00:00Z"), "backfill prompt one"),
+                ("s10", _ms("2026-10-10T12:00:01Z"), "backfill prompt two")]
+    before = _snapshot(h)
+    holder = _start_holder(h)
+    problems = []
+    try:
+        first = holder.stdout.readline().strip()
+        if first != "held":
+            raise AssertionError(f"the holder did not take the lock (printed {first!r})")
+        t0 = time.monotonic()
+        rc, out, err = _run(V2, ["register"], h, stdin=payload)
+        elapsed = time.monotonic() - t0
+        after = _snapshot(h)
+    finally:
+        holder_rc = _release_holder(holder)
+    if rc != 0:
+        problems.append(f"register rc={rc}: {err[-200:]}")
+    if elapsed > REGISTER_WAIT_LIMIT:
+        problems.append(f"register took {elapsed:.2f} s, limit {REGISTER_WAIT_LIMIT} s")
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    if len(lines) != 1 or "lock busy" not in lines[0]:
+        problems.append(f"register printed {lines!r}, expected one lock-busy line")
+    if after != before:
+        problems.append("register wrote something while the lock was held")
+    if holder_rc != 0:
+        problems.append(f"holder exited {holder_rc}")
+    returned_in = f"register returned in {elapsed:.2f} s"
+    # The next scan backfills the prompts that register skipped.
+    clear_throttle(h)
+    rc, out, err = v2_scan(h)
+    if rc != 0:
+        problems.append(f"scan after register rc={rc}: {err[-200:]}")
+    keys = _keys(_history(h))
+    for k in backfill:
+        if keys.count(k) != 1:
+            problems.append(f"after the next scan {k[2]!r} appears {keys.count(k)} times in history")
+    _fail(problems)
+    return returned_in
+
+
 CHECKS = [
     ("setup: temporary home redirects v1 and v2", check_setup),
     ("extraction equivalence (v1 and v2, same prompts and projects)", check_extraction),
@@ -618,6 +692,7 @@ CHECKS = [
     ("lock busy (one line, nothing written)", check_lock_busy),
     ("crash between index write and merge", check_crash_safety),
     ("register matches the base commit", check_register_matches_base),
+    ("register with the lock held: skipped in time, backfilled by the scan", check_register_lock_busy),
     ("throttle window kept at 300 s", check_throttle_window),
 ]
 
@@ -627,7 +702,7 @@ def main() -> int:
     try:
         for name, fn in CHECKS:
             try:
-                fn()
+                note = fn()
             except AssertionError as e:
                 failed += 1
                 print(f"FAIL {name}: {e}")
@@ -636,7 +711,7 @@ def main() -> int:
                 print(f"FAIL {name}: {type(e).__name__}: {e}")
             else:
                 passed += 1
-                print(f"PASS {name}")
+                print(f"PASS {name}" + (f" ({note})" if note else ""))
     finally:
         shutil.rmtree(T, ignore_errors=True)
     print(f"SUMMARY {passed}/{passed + failed} passed")
