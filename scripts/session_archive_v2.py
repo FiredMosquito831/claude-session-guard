@@ -75,7 +75,8 @@ STATE_DIR = ARCHIVE_DIR / "state"
 QUARANTINE_DIR = ARCHIVE_DIR / "quarantine"
 USAGE_LEDGER = ARCHIVE_DIR / "usage-ledger.jsonl"
 HASH_WINDOW = 4096      # bytes hashed at each end of the archived prefix
-LOCK_TIMEOUT = 60.0     # seconds to wait for one transcript's lock before skipping it
+LOCK_TIMEOUT = 60.0     # seconds to wait for one transcript's lock before skipping it (restore)
+SYNC_LOCK_TIMEOUT = 2.0 # the same wait for sync (PR-37): a busy transcript is skipped, and the next sync retries it
 
 
 def _sha(data: bytes) -> str:
@@ -224,10 +225,34 @@ def _sync_locked(live: Path, rel: str):
     return done
 
 
+def _unchanged(live: Path, arch: Path, state_path: Path) -> bool:
+    """True when the state proves there is nothing to archive, so no lock is needed (PR-37).
+
+    This is _fast_path with no new bytes, and nothing else: the live size equals the recorded offset,
+    the archive size matches, and the head and tail checksums match. _fast_path writes nothing in that
+    case. Every other case returns False, and the caller takes the lock as before.
+    """
+    state = _load_state(state_path)
+    if state is None:
+        return False
+    try:
+        size = os.stat(live).st_size
+        if size != state["live_offset"]:
+            return False                            # new bytes: the locked path appends them
+        return _fast_path(live, arch, state_path, state, size) == (0, 0)
+    except OSError:
+        return False                                # the locked path reports a missing file
+
+
 def sync_transcript(live: Path, rel: str):
     """Sync one live transcript. rel is its path under projects/, with forward slashes.
     Returns (status, lines, bytes); status is "ok", "skipped" (lock busy) or "missing"."""
-    lock = guardkit.lock_wait("session-archive-" + rel.replace("/", "__"), timeout=LOCK_TIMEOUT)
+    arch = TRANSCRIPTS_DIR / rel
+    state_path = STATE_DIR / f"{rel}.json"
+    if _unchanged(live, arch, state_path):
+        return "ok", 0, 0                           # PR-37: an unchanged transcript takes no lock
+    lock = guardkit.lock_wait("session-archive-" + rel.replace("/", "__"),
+                              timeout=SYNC_LOCK_TIMEOUT, reclaim_dead=True)
     if lock is None:
         return "skipped", 0, 0
     try:

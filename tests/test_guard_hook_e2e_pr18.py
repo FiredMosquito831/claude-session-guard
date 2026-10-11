@@ -7,6 +7,7 @@ name is the argument, the payload goes to stdin, and SESSION_GUARD_HOME points a
 After each child, the check reads back what the hook wrote: the register files, the archive mirror,
 the repaired transcript, the removal record, the backup and the repair log. Detached sweeps are
 waited for, so their unattended path runs for real. Nothing is stubbed.
+The detached archive (Stop, PreCompact) and repair (SessionEnd) are waited for in the same way.
 
 This file writes only under one temporary root (ROOT, from tempfile). Every path it uses is
 asserted to lie under ROOT. It does not read or write any settings file, hook registration or live
@@ -69,6 +70,7 @@ def child_env(home: Path) -> dict:
     env["SESSION_GUARD_HOME"] = str(assert_under_root(home))
     assert env["SESSION_GUARD_HOME"], "SESSION_GUARD_HOME must not be empty"
     env.pop("CLAUDE_SESSION_ID", None)      # the run must not depend on the live session
+    env["HOME"] = env["USERPROFILE"] = str(home)   # session_detect reads Path.home(); keep it in the temporary home
     return env
 
 
@@ -224,8 +226,10 @@ def session_start_register() -> float:
     payload = make_payload("SessionStart", sid, tp, **EVENT_FIELDS["SessionStart"])
     proc = run_hook("SessionStart", payload, home)
     steps, total = check_summary(proc, "SessionStart")
-    expect_steps(name, "SessionStart", steps, {"register": "ok", "sweep": "ok"})
-    wait_detached(home, "sweep-api_repair")
+    expect_steps(name, "SessionStart", steps, {"register": "ok", "detect": "ok", "scan": "ok",
+                                               "archive": "ok", "sweep_api": "ok", "usage": "ok"})
+    for detached in ("sweep-api_repair", "scan", "archive-all", "usage"):
+        wait_detached(home, detached)
     check_prompt_file(name, home / ".session_index.jsonl", sid)
     check_prompt_file(name, home / "history.jsonl", sid)
     return total
@@ -240,7 +244,8 @@ def stop_archive_mirror() -> float:
     payload = make_payload("Stop", sid, tp, **EVENT_FIELDS["Stop"])
     proc = run_hook("Stop", payload, home)
     steps, total = check_summary(proc, "Stop")
-    expect_steps(name, "Stop", steps, {"archive": "ok", "index": "ok", "usage": "ok"})
+    expect_steps(name, "Stop", steps, {"index": "ok", "archive": "ok"})
+    wait_detached(home, "archive-transcript")
     expect_mirror(name, home, "slugStop", sid, fixture)
     return total
 
@@ -254,9 +259,12 @@ def precompact_archive_mirror() -> float:
     payload = make_payload("PreCompact", sid, tp, **EVENT_FIELDS["PreCompact"])
     proc = run_hook("PreCompact", payload, home)
     steps, total = check_summary(proc, "PreCompact")
-    expect_steps(name, "PreCompact", steps, {"archive": "ok", "sweep": "ok"})
+    expect_steps(name, "PreCompact", steps, {"index": "ok", "archive": "ok",
+                                             "sweep_jsonl": "ok", "sweep_api": "ok"})
+    wait_detached(home, "archive-transcript")
     expect_mirror(name, home, "slugPre", sid, fixture)
     wait_detached(home, "sweep-jsonl_repair")
+    wait_detached(home, "sweep-api_repair")
     return total
 
 
@@ -270,6 +278,7 @@ def session_end_clear_repairs_and_archives() -> float:
     proc = run_hook("SessionEnd", payload, home)
     steps, total = check_summary(proc, "SessionEnd")
     expect_steps(name, "SessionEnd", steps, {"repair": "ok"})
+    wait_detached(home, "repair-from-hook")
     if tp.read_bytes() != jline(6) + b"\n":
         raise AssertionError(f"{name}: transcript is not the kept line alone ({tp.stat().st_size} bytes)")
     backups = backups_for(home, sid)
@@ -308,6 +317,7 @@ def session_end_resume_skips() -> float:
     proc = run_hook("SessionEnd", payload, home)
     steps, total = check_summary(proc, "SessionEnd")
     expect_steps(name, "SessionEnd", steps, {"repair": "ok"})
+    wait_detached(home, "repair-from-hook")
     if tp.read_bytes() != fixture:
         raise AssertionError(f"{name}: transcript changed on a resume (unchanged expected; "
                              f"{tp.stat().st_size} bytes now, {len(fixture)} before)")
@@ -332,7 +342,8 @@ def stop_unknown_extra_field() -> float:
                            x_future_field={"nested": [1, "two", None]})
     proc = run_hook("Stop", payload, home)
     steps, total = check_summary(proc, "Stop")
-    expect_steps(name, "Stop", steps, {"archive": "ok", "index": "ok", "usage": "ok"})
+    expect_steps(name, "Stop", steps, {"index": "ok", "archive": "ok"})
+    wait_detached(home, "archive-transcript")
     expect_mirror(name, home, "slugExtra", sid, fixture)
     return total
 

@@ -16,6 +16,8 @@ are run through the bundled launcher:
 sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" usage_db <command>
 ```
 
+The usage store moves to v2 in a separate step; until then, these usage commands use the v1 store.
+
 ## Choosing a command
 
 | User asks | Command |

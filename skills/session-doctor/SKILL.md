@@ -17,7 +17,7 @@ sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" <tool> <command>
 ## 1. The one number that matters
 
 ```
-sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" session_archive verify
+sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" session_archive_v2 verify
 ```
 
 Read the line **"live files missing archived lines"**.
@@ -53,7 +53,7 @@ If the count is non-zero, investigate in this order:
    understand it can only delay deletion; the archive is what makes retention
    permanent.
 
-The bundled `jsonl_repair` is safe by construction: it preserves unparseable
+The bundled `jsonl_repair_v2` is safe by construction: it preserves unparseable
 lines verbatim, skips live and recently-written files, writes atomically,
 aborts if a file changes mid-scan, and archives every removed line before
 rewriting. If you find a *different* repair tool, that is the suspect.
@@ -65,39 +65,48 @@ If a resume fails with:
     API Error: 400 messages.N.content.0.thinking:
     each thinking block must contain non-whitespace thinking
 
-that is a DIFFERENT fault from anything `jsonl_repair` handles. The line is
+that is a DIFFERENT fault from anything `jsonl_repair_v2` handles. The line is
 valid JSON; it is the Messages API that rejects it. Claude Code writes one
 assistant response as several transcript lines sharing a `message.id` and
 merges them on replay, so an empty thinking block on any of those lines poisons
 the whole conversation.
 
-    sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" api_repair scan
-    sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" api_repair fix <session-id>
-    sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" api_repair fix --all
+    sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" api_repair_v2 scan
+    sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" api_repair_v2 fix <session-id>
+    sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" api_repair_v2 fix --all
 
 `scan` never writes. `fix` drops only the empty block -- or the whole line when
 the block is all the line holds -- re-links `parentUuid` so the chain stays
 connected, and archives everything it removes first. Token accounting is
 unaffected: the sibling lines of the same message carry the same `usage`.
 
-A live session is refused (recent mtime, or a matching `CLAUDE_SESSION_ID`).
-Close the session before repairing it.
+`fix <session-id>` refuses the session named by `CLAUDE_SESSION_ID`, and a transcript modified less
+than 2 minutes ago. It does not check whether a Claude Code process is still running, so close the
+session before repairing it.
 
 ## 3. Restore what was lost
 
+Step 1 puts archived-only sessions back. It writes only transcripts that have no live file:
+
 ```
-sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" session_archive restore
+sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" session_archive_v2 restore
 ```
 
-Copies archived-only sessions back into `~/.claude/projects/` and merges
-archived lines back into any live file that lost some. Restored sessions become
-resumable again.
+For each one it creates the file under `~/.claude/projects/` from the archived bytes. It never overwrites an existing file. A live transcript that lost lines is not changed by this step; it is reported as "shrunken, not touched".
+
+Step 2 merges archived lines back into live transcripts that lost some. **This writes to live transcripts. Run it only if you have decided to.**
+
+```
+sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" session_archive_v2 restore --merge-live
+```
+
+It merges archived lines into existing live transcripts, which writes to them; it is gated, so a file changed in the last hour, a session still running, or an unreadable process list is left alone, and the previous bytes are kept in quarantine.
 
 To make them appear in the resume picker, rebuild the prompt index:
 
 ```
-sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" session_indexer scan --full
-sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" session_indexer merge
+sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" session_indexer_v2 scan --full
+sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" session_indexer_v2 merge
 ```
 
 Restored files must land in the correct project directory or they will not be
@@ -121,7 +130,7 @@ status of a session:
     sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" session_find --all
 
 Each entry is marked `*` live (resume right now, the command is printed),
-`~` archived only (run `session_archive restore` first), or `!` no transcript
+`~` archived only (run `session_archive_v2 restore` first), or `!` no transcript
 anywhere -- the prompts survive in history.jsonl but the conversation itself
 predates the archive and is gone.
 
@@ -134,6 +143,8 @@ and cannot be resumed by any means -- only its prompts survive.
 ```
 sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" usage_db stats
 ```
+
+The usage store moves to v2 in a separate step; until then, these usage commands use the v1 store.
 
 If event counts look short, re-ingest with `usage_db sync` (incremental) or
 `usage_db build` (full re-scan). Both upsert on event `uuid`, so re-running is

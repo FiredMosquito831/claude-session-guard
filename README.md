@@ -20,9 +20,9 @@ Claude Session Guard does three things:
 
 ## Status
 
-The plugin's manifests are at version 1.4.2. Its changes are listed under "Unreleased" in CHANGELOG.md, which has no 1.4.2 section yet. The v2 tools (archive, repair, index, usage store and the hook dispatcher) are in this repository and tested. They are described under "Unreleased" in CHANGELOG.md.
+The plugin's manifests are at version 2.0.0. Its changes are listed under "2.0.0" in CHANGELOG.md. The v2 tools (archive, repair, index, usage store and the hook dispatcher) are in this repository and tested. They are described under "2.0.0" in CHANGELOG.md.
 
-The hooks in `hooks/hooks.json` still run the 1.4.0 tools. The v2 tools are wired into the hooks only in a later, separate step. Nothing on a user's machine changes until the user installs the plugin or makes that change themselves.
+The hooks in `hooks/hooks.json` run the v2 tools. The v1 tools are still in the repository and will be removed in a later step. Nothing on a user's machine changes until the user installs the plugin or makes that change themselves.
 
 ## Install
 
@@ -35,10 +35,12 @@ Then build the initial archive and database (one time, a few minutes on a large
 history):
 
 ```bash
-sh "$CLAUDE_PLUGIN_ROOT/scripts/run.sh" session_archive sync --full
+sh "$CLAUDE_PLUGIN_ROOT/scripts/run.sh" session_archive_v2 sync --all
 sh "$CLAUDE_PLUGIN_ROOT/scripts/run.sh" usage_db build
 sh "$CLAUDE_PLUGIN_ROOT/scripts/run.sh" usage_db export
 ```
+
+The usage store moves to v2 in a separate step; until then, these usage commands use the v1 store.
 
 After that the hooks keep it current on their own.
 
@@ -73,6 +75,8 @@ Ask in plain language — the skills trigger on their own:
 
 ## CLI
 
+The usage store moves to v2 in a separate step; until then, these usage commands use the v1 store.
+
 ```bash
 R="sh $CLAUDE_PLUGIN_ROOT/scripts/run.sh"
 
@@ -88,9 +92,10 @@ $R usage_db sql "SELECT ..." # arbitrary read-only SQL
 
 $R session_find              # browse/search sessions across ALL folders
 $R session_find docker       # search prompts everywhere
-$R session_archive verify    # is anything eating session data?
-$R session_archive restore   # put lost sessions back
-$R jsonl_repair --all --dry-run
+$R session_archive_v2 verify                # is anything eating session data?
+$R session_archive_v2 restore               # step 1: put archived-only sessions back (missing files only)
+$R session_archive_v2 restore --merge-live  # step 2: WRITES to live transcripts, merging archived lines (gated)
+$R jsonl_repair_v2 --all --dry-run
 ```
 
 ## Resuming old sessions
@@ -103,7 +108,7 @@ dies with:
     API Error: 400 messages.N.content.0.thinking:
     each thinking block must contain non-whitespace thinking
 
-`api_repair` fixes exactly this. It runs at **SessionEnd**, repairing the
+`api_repair_v2` fixes exactly this. It runs at **SessionEnd**, repairing the
 transcript at the one moment it is provably not being written to — so a session
 is clean the instant it closes, and there is no window in which resuming it
 fails. A SessionStart sweep catches anything missed (a crash, a session that
@@ -112,9 +117,9 @@ that is all the line holds), re-links the `parentUuid` chain, and archives
 whatever it removes. Nothing else is touched.
 
 ```bash
-$R api_repair scan              # report only, never writes
-$R api_repair fix <session-id>  # repair one session
-$R api_repair fix --all         # repair everything eligible
+$R api_repair_v2 scan              # report only, never writes
+$R api_repair_v2 fix <session-id>  # repair one session
+$R api_repair_v2 fix --all         # repair everything eligible
 ```
 
 ## Finding sessions across folders
@@ -206,7 +211,7 @@ Use both. They answer different questions.
 
 ## Safety properties of the repair pass
 
-`jsonl_repair` fixes genuinely malformed JSONL. It cannot destroy data:
+`jsonl_repair_v2` fixes genuinely malformed JSONL. It cannot destroy data:
 
 - Unparseable lines are **preserved verbatim**, never deleted.
 - Reads and writes use `errors='surrogateescape'`, so arbitrary bytes round-trip
@@ -220,8 +225,7 @@ Use both. They answer different questions.
   abandoned if archiving fails.
 - A full backup is always taken. There is no `--no-backup` option.
 
-Only exact-duplicate and control-character-only lines are ever removed, and both
-are recoverable from `backups/sessions/removed-lines-archive.jsonl`.
+Only blank, duplicate and control-character-only lines are ever removed. A line that needs repair is rewritten. Each removed line, and the original of each rewritten line, is recoverable from `backups/sessions/removed-lines-archive.jsonl`.
 
 ## Disk
 
