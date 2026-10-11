@@ -34,7 +34,7 @@ sys.path.insert(0, str(SCRIPTS))
 import guardkit as gk  # noqa: E402  CLAUDE_DIR honours SESSION_GUARD_HOME, as the tools do
 
 # Fixed allowlist. Other scripts join in their own PRs.
-ALLOWLIST = ["guardkit.py", "api_repair_v2.py", "usage_db_v2.py"]
+ALLOWLIST = ["guardkit.py", "api_repair_v2.py", "usage_db_v2.py", "session_archive_v2.py", "jsonl_repair_v2.py", "session_indexer_v2.py"]
 GATE_TIMEOUT_S = 900
 
 
