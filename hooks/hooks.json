@@ -5,8 +5,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" session_archive sync",
-            "timeout": 90
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" session_indexer_v2 register",
+            "timeout": 10
           }
         ]
       },
@@ -14,7 +14,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" session_indexer scan",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" session_indexer_v2 scan",
             "timeout": 60
           }
         ]
@@ -23,7 +23,25 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" api_repair fix --all",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" session_detect",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" session_archive_v2 sync",
+            "timeout": 60
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" api_repair_v2 fix --all",
             "timeout": 180
           }
         ]
@@ -34,8 +52,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" session_archive sync",
-            "timeout": 90
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" session_archive_v2 sync",
+            "timeout": 60
           }
         ]
       },
@@ -43,7 +61,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" session_indexer merge",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" session_indexer_v2 merge",
             "timeout": 60
           }
         ]
@@ -72,8 +90,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" session_archive sync",
-            "timeout": 90
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" session_archive_v2 sync",
+            "timeout": 60
           }
         ]
       },
@@ -81,17 +99,26 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" jsonl_repair --all",
-            "timeout": 120
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" api_repair fix --all",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" jsonl_repair_v2 --all",
             "timeout": 180
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" api_repair_v2 fix --all",
+            "timeout": 180
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" session_indexer_v2 merge",
+            "timeout": 15
           }
         ]
       }
@@ -101,7 +128,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" api_repair from-hook",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" api_repair_v2 from-hook",
             "timeout": 60
           }
         ]
