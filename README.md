@@ -20,7 +20,7 @@ Claude Session Guard does three things:
 
 ## Status
 
-The plugin's manifests are at version 1.4.2. Its changes are listed under "Unreleased" in CHANGELOG.md, which has no 1.4.2 section yet. The v2 tools (archive, repair, index, usage store and the hook dispatcher) are in this repository and tested. They are described under "Unreleased" in CHANGELOG.md.
+The plugin's manifests are at version 2.0.0. Its changes are listed under "2.0.0" in CHANGELOG.md. The v2 tools (archive, repair, index, usage store and the hook dispatcher) are in this repository and tested. They are described under "2.0.0" in CHANGELOG.md.
 
 The hooks in `hooks/hooks.json` run the v2 tools. The v1 tools are still in the repository and will be removed in a later step. Nothing on a user's machine changes until the user installs the plugin or makes that change themselves.
 
