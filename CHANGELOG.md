@@ -1,5 +1,32 @@
 # Changelog
 
+## 2.0.0 (2026-10-11; release prep, not yet tagged)
+
+### Status
+
+The repository contains the changes listed below. On the author's machine, some hooks run the v2 tools and others do not yet. The usage store is on schema v2 there. The hook switch to the dispatcher (PR-38) and the redeploy of the archive tools are pending the user's go.
+
+### Added
+
+- PR-25: the usage store reads each session at close (`session <path> <session_id>`), with a `catch-up` run for sessions whose close never ran, and a per-session `usage_rollup` table (schema 2).
+- PR-31: `scripts/session_detect.py` is tracked in the repository, byte-identical to the live copy when it was added.
+- PR-32: `session_indexer_v2` runs a start-up scan under the index lock. The `register` queue waits briefly for the lock and skips when it is busy.
+
+### Changed
+
+- PR-27: usage database writes are batched into fewer transactions. Stored rows do not change.
+- PR-28: two read-only transcript walks use `scandir`.
+- PR-29: `usage_db_v2.py` is in the deploy allowlist.
+- PR-30: `session_archive_v2.py`, `jsonl_repair_v2.py` and `session_indexer_v2.py` are in the deploy allowlist.
+- PR-33: the plugin's hook list (`hooks/hooks.json`) points at the v2 scripts.
+- PR-34: the skills and README point at the v2 commands.
+- PR-37: the archive sync skips the lock for transcripts that have not changed, and a lock whose holder is dead is reclaimed.
+- PR-38: the hook dispatcher (`scripts/guard_hook.py`) runs heavy steps detached and moves usage ingest to catch-up. Every check is kept.
+
+### Fixed
+
+- PR-36: `session_detect` skips a history line that is not a JSON object, or that exceeds the JSON depth limit, and keeps reading.
+
 ## 1.4.2 (2026-10-10; staged tools, not wired into hooks yet)
 
 Version 1.4.2 is the first release of the v2 tools. Its hooks still run the 1.4.0 tools until a later, separate step. The hooks on a user's machine do not change until that step. The install command changed with the rename; see the Changed entry.
