@@ -37,7 +37,7 @@ def load_history_session_ids() -> set:
                     session_id = entry.get('sessionId')
                     if isinstance(session_id, str) and session_id:
                         ids.add(session_id)
-                except (ValueError, TypeError, AttributeError):
+                except (ValueError, TypeError, AttributeError, RecursionError):
                     pass
     except Exception:
         pass

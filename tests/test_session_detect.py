@@ -179,6 +179,15 @@ def main():
         expect_line("9 only bad history lines and no session reports NEW", root,
                     expected_line("NEW", SID_A, "history_jsonl_lookup", 0))
 
+        # 10. A line nested past the JSON depth limit (PR-36 fix round): json.loads raises RecursionError on it.
+        #     That must skip the line only, so the session on the next line is still read: RESUME, 1 entry.
+        root = scenario("deep_line_then_session")
+        deep = "[" * 20000 + "]" * 20000
+        write_history(root, [deep, history_line(SID_A, 1728600001000, "first prompt")])
+        write_settings(root, SID_A)
+        expect_line("10 session after a line past the JSON depth limit reports RESUME", root,
+                    expected_line("RESUME", SID_A, "found_in_history", 1))
+
         # 5. The script exits 0 in every run above.
         if EXIT_CODES and all(code == 0 for code in EXIT_CODES):
             emit("PASS", "5 script exits 0 in every run", f"{len(EXIT_CODES)} runs")
