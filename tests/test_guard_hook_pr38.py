@@ -4,12 +4,13 @@ Run from the worktree:  python -I -B tests/test_guard_hook_pr38.py
 Each check prints PASS or FAIL <name>: <detail>. Exit 1 if any check fails.
 
 Environment:
-  PR38_HOME_BASE  folder for the temporary home. It must lie outside C:/Users/fgghk. The default
-                  temp folder on this machine is under that folder, so set this variable there.
+  PR38_HOME_BASE  optional folder for the temporary home. The default is
+                  C:/tmp/claude/C--Users-fgghk/pr38-tests, the project scratch root (CLAUDE.md, section 5).
   PR38_SCRIPTS    another scripts folder to test (the mutation check uses a scratch copy of scripts/).
 
-The temporary home is set before any plugin import, and it is checked to lie outside C:/Users/fgghk.
-Nothing under C:/Users/fgghk/.claude is read, listed, statted or written. Subprocesses are faked:
+The temporary home is set before any plugin import. Its .claude folder is checked not to equal, or sit
+under, the live folder C:/Users/fgghk/.claude. That live folder is the property guarded, not the whole
+profile. Nothing under the live folder is read, listed, statted or written. Subprocesses are faked:
 inline steps go through a stub of run_tool, and detached launches go through a fake Popen.
 """
 import contextlib
@@ -28,7 +29,8 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = Path(os.environ["PR38_SCRIPTS"]).resolve() if os.environ.get("PR38_SCRIPTS") else REPO / "scripts"
-FORBIDDEN = os.path.normcase(os.path.abspath("C:/Users/fgghk"))
+LIVE_CLAUDE = os.path.normcase(os.path.abspath("C:/Users/fgghk/.claude"))
+DEFAULT_BASE = Path("C:/tmp/claude/C--Users-fgghk") / "pr38-tests"
 DETACH_FLAGS_VALUE = 0x08000208      # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
 
 
@@ -56,13 +58,14 @@ def guard(name, fn):
 
 # --- the temporary home, set before any plugin import --------------------------
 
-BASE = os.environ.get("PR38_HOME_BASE") or tempfile.gettempdir()
-if _under(BASE, FORBIDDEN):
-    print("FAIL temp home outside C:/Users/fgghk: the temp base is under it; set PR38_HOME_BASE")
+BASE = Path(os.environ.get("PR38_HOME_BASE") or DEFAULT_BASE)
+if _under(BASE, LIVE_CLAUDE):                       # checked before anything is created
+    print("FAIL temp home outside the live .claude folder: the base is inside it; set PR38_HOME_BASE")
     sys.exit(1)
+BASE.mkdir(parents=True, exist_ok=True)
 HOME = Path(tempfile.mkdtemp(prefix="pr38_home_", dir=BASE))
-if _under(HOME, FORBIDDEN):
-    print("FAIL temp home outside C:/Users/fgghk: " + str(HOME))
+if _under(HOME / ".claude", LIVE_CLAUDE):
+    print("FAIL temp home outside the live .claude folder: " + str(HOME / ".claude"))
     sys.exit(1)
 os.environ["SESSION_GUARD_HOME"] = str(HOME / ".claude")
 os.environ["HOME"] = str(HOME)
@@ -73,7 +76,7 @@ import guardkit as gk  # noqa: E402
 import guard_hook as gh  # noqa: E402
 
 guard("guardkit home is the temporary home", lambda: (
-    _under(gk.CLAUDE_DIR, HOME) and not _under(gk.CLAUDE_DIR, FORBIDDEN), str(gk.CLAUDE_DIR)))
+    _under(gk.CLAUDE_DIR, HOME) and not _under(gk.CLAUDE_DIR, LIVE_CLAUDE), str(gk.CLAUDE_DIR)))
 
 
 # --- fakes ------------------------------------------------------------------
@@ -347,6 +350,8 @@ guard("x2 scan is gated by its last launch's pid and age", x2_scan_gate_by_pid_a
 guard("x3 a stale or dead sweep lock does not block", x3_stale_sweep_lock_does_not_block)
 
 shutil.rmtree(HOME, ignore_errors=True)
+with contextlib.suppress(OSError):
+    BASE.rmdir()                                    # only if empty
 failed = RESULTS.count(False)
 print(f"{len(RESULTS) - failed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
