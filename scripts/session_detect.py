@@ -29,11 +29,15 @@ def load_history_session_ids() -> set:
                 line = line.strip()
                 if not line:
                     continue
+                # A bad line is skipped on its own. It must not end the loop, or later sessions read as NEW.
                 try:
                     entry = json.loads(line)
-                    if 'sessionId' in entry:
-                        ids.add(entry['sessionId'])
-                except (json.JSONDecodeError, ValueError):
+                    if not isinstance(entry, dict):
+                        continue
+                    session_id = entry.get('sessionId')
+                    if isinstance(session_id, str) and session_id:
+                        ids.add(session_id)
+                except (ValueError, TypeError, AttributeError):
                     pass
     except Exception:
         pass
