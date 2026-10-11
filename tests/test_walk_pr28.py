@@ -233,6 +233,67 @@ def check_filelink_with_files_only():
     return ("proj/ln.jsonl" in walk(files_only=True)), "file link not yielded with files_only=True"
 
 
+class _ProxyEntry:
+    """A DirEntry stand-in: delegates to the real entry, except that stat() raises for boom.jsonl."""
+
+    def __init__(self, real):
+        self._real = real
+        self.name = real.name
+        self.path = real.path
+
+    def is_dir(self, follow_symlinks=True):
+        return self._real.is_dir(follow_symlinks=follow_symlinks)
+
+    def stat(self, follow_symlinks=True):
+        if self.name == "boom.jsonl":
+            raise PermissionError(13, "denied")
+        return self._real.stat(follow_symlinks=follow_symlinks)
+
+
+class _ProxyScan:
+    """What the patched os.scandir returns: a context manager whose iteration yields proxy entries."""
+
+    def __init__(self, real_cm):
+        self._cm = real_cm
+
+    def __enter__(self):
+        self._it = self._cm.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._cm.__exit__(*exc)
+
+    def __iter__(self):
+        for e in self._it:
+            yield _ProxyEntry(e)
+
+
+def check_stat_permission_error_propagates():
+    perm = Path(HOME) / "perm-walk"
+    write(perm / "boom.jsonl")
+    write(perm / "ok.jsonl")
+    real_scandir = os.scandir
+    results = {}
+
+    def fake_scandir(path):
+        return _ProxyScan(real_scandir(path))
+
+    os.scandir = fake_scandir
+    try:
+        for flag in (True, False):
+            try:
+                list(gk.transcript_files(perm, skip_unstattable=flag))
+                results[flag] = "no error"
+            except PermissionError as exc:
+                results[flag] = f"PermissionError errno {exc.errno}"
+            except Exception as exc:
+                results[flag] = type(exc).__name__
+    finally:
+        os.scandir = real_scandir
+    ok = all(v.startswith("PermissionError") for v in results.values())
+    return ok, f"outcome by skip_unstattable: {results}"
+
+
 # (name, function, needs symbolic links)
 CHECKS = [
     ("site A equivalence: session_transcripts matches the rglob oracle", site_a_check, False),
@@ -241,6 +302,8 @@ CHECKS = [
     ("helper: skip_acompact=False keeps compaction files", check_skip_acompact_false_keeps, False),
     ("helper: skip_unstattable=False raises OSError on a dangling link", check_default_raises_on_dangling, True),
     ("helper: skip_unstattable=True skips a dangling link", check_skip_unstattable_skips_dangling, True),
+    ("helper: a stat PermissionError propagates (skip_unstattable True and False)",
+     check_stat_permission_error_propagates, False),
     ("helper: ignore_case=False excludes UP.JSONL", check_ignore_case_false_excludes_upper, False),
     ("helper: ignore_case=True includes UP.JSONL on Windows only", check_ignore_case_true, False),
     ("helper: a directory named dir.jsonl is never yielded", check_directory_never_yielded, False),

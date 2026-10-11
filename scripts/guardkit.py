@@ -246,7 +246,7 @@ def transcript_files(root: Path = PROJECTS_DIR, top_only: bool = False, *,
 
     top_only=True yields only <project>/<session>.jsonl and skips subagent and workflow transcripts.
     skip_acompact=True (default) skips compaction files; False keeps them. Default is today's behaviour.
-    skip_unstattable=False (default) lets an OSError from stat propagate; True skips that entry, as for a broken link.
+    skip_unstattable=False (default) lets an OSError from stat propagate. skip_unstattable=True skips an entry whose stat fails the way Path.is_file() ignores (a broken link); other errors propagate.
     ignore_case=False (default) matches ".jsonl" case-sensitively; True matches it as the platform does (case-insensitive on Windows).
     files_only=False (default) yields any entry whose stat succeeds; True yields only regular files, as Path.is_file().
     """
@@ -271,7 +271,8 @@ def transcript_files(root: Path = PROJECTS_DIR, top_only: bool = False, *,
                 try:
                     st = e.stat()
                 except OSError:
-                    if skip_unstattable:
+                    # Skip only what Path.is_file() ignores (a broken link). Any other error stays loud, as before.
+                    if skip_unstattable and not Path(e.path).is_file():
                         continue
                     raise
                 if files_only and not stat.S_ISREG(st.st_mode):
