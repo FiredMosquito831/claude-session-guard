@@ -1,6 +1,6 @@
 """
 Tests for scripts/session_detect.py (PR-31), the SessionStart helper that prints NEW or RESUME.
-The script is a byte-identical copy of the live file. It takes no stdin and no environment variable
+The script is the repo copy, which may differ from the live copy until a deploy (PR-36). It takes no stdin and no environment variable
 for the session ID. It reads "sessionId" from <home>/.claude/settings.local.json, then looks for that
 ID in <home>/.claude/history.jsonl, and in <home>/.claude/projects/<folder>/<session>.jsonl.
 
@@ -145,6 +145,48 @@ def main():
         (project / f"{SID_A}.jsonl").write_bytes(b"")
         expect_line("6 transcript in projects/ reports RESUME", root,
                     expected_line("RESUME", SID_A, "jsonl_file_exists", 1))
+
+        # Bad history lines (PR-36): none of them is a JSON object with a string sessionId. Before the fix,
+        # the first one ended the read, so a session on a later line was reported NEW.
+        bad_lines = [
+            "5",
+            "null",
+            "[]",
+            '"text"',
+            '{"sessionId": 7}',
+            '{"sessionId": ["x"]}',
+            "{not json",
+        ]
+
+        # 7. The defect: the session is on the LAST line, after the bad lines. It must report RESUME.
+        root = scenario("bad_lines_then_session")
+        write_history(root, bad_lines + [history_line(SID_A, 1728600001000, "first prompt")])
+        write_settings(root, SID_A)
+        expect_line("7 session on the last line after bad history lines reports RESUME", root,
+                    expected_line("RESUME", SID_A, "found_in_history", 1))
+
+        # 8. The session is on the first line, before the bad lines. It still reports RESUME, with 1 entry.
+        root = scenario("session_then_bad_lines")
+        write_history(root, [history_line(SID_A, 1728600001000, "first prompt")] + bad_lines)
+        write_settings(root, SID_A)
+        expect_line("8 session on the first line before bad history lines reports RESUME", root,
+                    expected_line("RESUME", SID_A, "found_in_history", 1))
+
+        # 9. Only bad lines and no session: NEW, with 0 entries, and the script exits 0.
+        root = scenario("only_bad_lines")
+        write_history(root, bad_lines)
+        write_settings(root, SID_A)
+        expect_line("9 only bad history lines and no session reports NEW", root,
+                    expected_line("NEW", SID_A, "history_jsonl_lookup", 0))
+
+        # 10. A line nested past the JSON depth limit (PR-36 fix round): json.loads raises RecursionError on it.
+        #     That must skip the line only, so the session on the next line is still read: RESUME, 1 entry.
+        root = scenario("deep_line_then_session")
+        deep = "[" * 20000 + "]" * 20000
+        write_history(root, [deep, history_line(SID_A, 1728600001000, "first prompt")])
+        write_settings(root, SID_A)
+        expect_line("10 session after a line past the JSON depth limit reports RESUME", root,
+                    expected_line("RESUME", SID_A, "found_in_history", 1))
 
         # 5. The script exits 0 in every run above.
         if EXIT_CODES and all(code == 0 for code in EXIT_CODES):
