@@ -80,18 +80,27 @@ the block is all the line holds -- re-links `parentUuid` so the chain stays
 connected, and archives everything it removes first. Token accounting is
 unaffected: the sibling lines of the same message carry the same `usage`.
 
-A live session is refused (recent mtime, or a matching `CLAUDE_SESSION_ID`).
-Close the session before repairing it.
+`fix <session-id>` refuses the session named by `CLAUDE_SESSION_ID`, and a transcript modified less
+than 2 minutes ago. It does not check whether a Claude Code process is still running, so close the
+session before repairing it.
 
 ## 3. Restore what was lost
+
+Step 1 puts archived-only sessions back. It writes only transcripts that have no live file:
+
+```
+sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" session_archive_v2 restore
+```
+
+For each one it creates the file under `~/.claude/projects/` from the archived bytes. It never overwrites an existing file. A live transcript that lost lines is not changed by this step; it is reported as "shrunken, not touched".
+
+Step 2 merges archived lines back into live transcripts that lost some. **This writes to live transcripts. Run it only if you have decided to.**
 
 ```
 sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" session_archive_v2 restore --merge-live
 ```
 
-Copies archived-only sessions back into `~/.claude/projects/` and merges
-archived lines back into any live file that lost some. Restored sessions become
-resumable again.
+It merges archived lines into existing live transcripts, which writes to them; it is gated, so a file changed in the last hour, a session still running, or an unreadable process list is left alone, and the previous bytes are kept in quarantine.
 
 To make them appear in the resume picker, rebuild the prompt index:
 

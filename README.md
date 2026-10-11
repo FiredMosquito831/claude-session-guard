@@ -93,7 +93,8 @@ $R usage_db sql "SELECT ..." # arbitrary read-only SQL
 $R session_find              # browse/search sessions across ALL folders
 $R session_find docker       # search prompts everywhere
 $R session_archive_v2 verify                # is anything eating session data?
-$R session_archive_v2 restore --merge-live  # put lost sessions back
+$R session_archive_v2 restore               # step 1: put archived-only sessions back (missing files only)
+$R session_archive_v2 restore --merge-live  # step 2: WRITES to live transcripts, merging archived lines (gated)
 $R jsonl_repair_v2 --all --dry-run
 ```
 
