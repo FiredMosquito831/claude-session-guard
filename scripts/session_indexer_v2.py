@@ -15,6 +15,10 @@ State, in guardkit.STATE_DIR:
   index_keys.bin     one 16-byte BLAKE2b digest per known key; only ever appended to
   index_last_merge   time of the last merge attempt that got the lock (the throttle)
 
+The start-up scan (scan_new_sessions) keeps its watermark in ~/.claude, the file session_indexer.py
+writes, so a watermark left by v1 keeps working. It is not in STATE_DIR.
+  .session_scan_last  start time of the last scan, written after the scan's index write
+
 A key is (sessionId, timestamp, display[:500]). history_offset is the length of the prefix
 of history.jsonl that has been indexed; it always ends just after a newline. Lines after it,
 whether written by Claude Code or by this module, are read and indexed on the next merge.
@@ -45,7 +49,10 @@ KEYS_FILE = STATE_DIR / KEYS_NAME
 THROTTLE_FILE = STATE_DIR / "index_last_merge"
 LOCK_NAME = "session-index"
 LOCK_TIMEOUT = 30.0
+REGISTER_LOCK_WAIT = 2.0   # register runs under a 10 s hook timeout; past this it skips queuing
 DEFAULT_MIN_INTERVAL = 300.0
+SCAN_WATERMARK_FILE = Path.home() / ".claude" / ".session_scan_last"  # the file session_indexer.py scan writes
+SCAN_OVERLAP_SECONDS = 600.0  # v1 also re-reads transcripts modified in the 10 minutes before the watermark
 HEAD_BYTES = 4096
 DIGEST_SIZE = 16
 NO_SESSION_MSG = "[session-index] register: no session in payload; nothing to do"
@@ -403,28 +410,38 @@ def extract_prompts(jsonl_file: Path, project_name: str = "") -> list:
     return out
 
 
-def _queue_prompts(prompts: list) -> int:
-    """Append prompts whose key is not yet in the parallel index. Returns how many were appended."""
+def _queue_prompts(prompts: list, lock_timeout: float = LOCK_TIMEOUT):
+    """Append prompts whose key is not yet in the parallel index, under the session-index lock.
+
+    Returns how many were appended, or None when the lock was not free within lock_timeout
+    (nothing was written).
+    """
+    lock = gk.lock_wait(LOCK_NAME, timeout=lock_timeout)
+    if lock is None:
+        return None
     try:
-        blob = PARALLEL_INDEX.read_bytes()
-    except FileNotFoundError:
-        blob = b""
-    known = set()
-    for raw in blob.split(b"\n"):
-        if raw.strip():
-            entry = parse_line(raw)
-            if entry is not None:
-                known.add(key_digest(entry))
-    lines, seen = [], set()
-    for prompt in prompts:
-        d = key_digest(prompt)
-        if d in known or d in seen:
-            continue
-        seen.add(d)
-        lines.append(encode_line(prompt))
-    if lines:
-        _append_bytes(PARALLEL_INDEX, lines)
-    return len(lines)
+        try:
+            blob = PARALLEL_INDEX.read_bytes()
+        except FileNotFoundError:
+            blob = b""
+        known = set()
+        for raw in blob.split(b"\n"):
+            if raw.strip():
+                entry = parse_line(raw)
+                if entry is not None:
+                    known.add(key_digest(entry))
+        lines, seen = [], set()
+        for prompt in prompts:
+            d = key_digest(prompt)
+            if d in known or d in seen:
+                continue
+            seen.add(d)
+            lines.append(encode_line(prompt))
+        if lines:
+            _append_bytes(PARALLEL_INDEX, lines)
+        return len(lines)
+    finally:
+        lock.release()
 
 
 def register_from_payload(payload: dict,
@@ -433,6 +450,10 @@ def register_from_payload(payload: dict,
 
     The payload carries session_id and transcript_path (guardkit.read_hook_payload). With no
     transcript there is nothing to do, and that is not an error.
+
+    The queue waits at most REGISTER_LOCK_WAIT for the session-index lock. If it is busy, nothing is
+    queued and the merge is skipped; the next scan backfills the prompts, because it reads this
+    transcript while the transcript is newer than the last scan's cutoff.
     """
     transcript = payload.get("transcript_path") if isinstance(payload, dict) else None
     if not isinstance(transcript, str) or not transcript:
@@ -444,11 +465,108 @@ def register_from_payload(payload: dict,
         return MergeResult("noop", 0, "transcript_path does not exist")
     session_id = payload.get("session_id") or path.stem
     prompts = extract_prompts(path, path.parent.name)
-    queued = _queue_prompts(prompts)
-    result = merge_history(min_interval_seconds)
+    queued = _queue_prompts(prompts, lock_timeout=REGISTER_LOCK_WAIT)
+    if queued is None:
+        # Skipped, not failed: nothing was written, and the next scan queues these prompts.
+        print(f"[session-index] register {session_id}: lock busy; nothing queued, the next scan backfills it")
+        return MergeResult("busy", 0, "session-index lock busy; prompts left for the next scan")
+    result = merge_history(min_interval_seconds, lock_timeout=REGISTER_LOCK_WAIT)
     print(f"[session-index] register {session_id}: {len(prompts)} prompts, {queued} queued; "
           f"merge {result.status} ({result.added} added)")
     return result
+
+
+# --- start-up scan -----------------------------------------------------------
+# Port of session_indexer.py `scan`, the only step that reads the transcripts and backfills
+# prompts from sessions that ended without a clean Stop. Differences from v1, all deliberate:
+# the index is written only under the session-index lock; history.jsonl is changed only by
+# merge_history (an append); the watermark is written atomically, after the index write.
+
+def _prompt_keys_in(path: Path) -> set:
+    """entry_key of every parseable line of an index or history file. Call with the lock held."""
+    keys = set()
+    try:
+        blob = path.read_bytes()
+    except FileNotFoundError:
+        return keys
+    for raw in blob.split(b"\n"):
+        if raw.strip():
+            entry = parse_line(raw)
+            if entry is not None:
+                keys.add(entry_key(entry))
+    return keys
+
+
+def _scan_read_watermark(full: bool) -> float:
+    """Start time of the last scan, from v1 or v2. 0.0 when there is none, or when full."""
+    if full:
+        return 0.0
+    try:
+        return float(SCAN_WATERMARK_FILE.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return 0.0
+
+
+def _scan_transcripts(cutoff: float) -> list:
+    """Prompts from the top-level transcript of each project, skipping what v1 skipped."""
+    found = []
+    for project_dir in PROJECTS_DIR.iterdir():
+        if not project_dir.is_dir():
+            continue
+        for jsonl_file in project_dir.glob("*.jsonl"):
+            if "subagents" in str(jsonl_file) or "acompact" in str(jsonl_file):
+                continue
+            if cutoff:
+                try:
+                    if jsonl_file.stat().st_mtime < cutoff:
+                        continue
+                except OSError:
+                    continue
+            found.extend(extract_prompts(jsonl_file, project_dir.name))
+    return found
+
+
+def _scan_locked(full: bool) -> int:
+    """The scan body. Call with the session-index lock held. Returns how many lines were queued."""
+    if not PROJECTS_DIR.exists():
+        return 0                      # v1 returned here as well, and left the watermark alone
+    scan_started = time.time()        # taken before the walk, so a file written during it is read next time
+    watermark = _scan_read_watermark(full)
+    cutoff = watermark - SCAN_OVERLAP_SECONDS if watermark else 0.0
+    prompts = _scan_transcripts(cutoff)
+    known = _prompt_keys_in(PARALLEL_INDEX) | _prompt_keys_in(OFFICIAL_HISTORY)
+    lines, queued = [], set()
+    for prompt in prompts:
+        key = entry_key(prompt)
+        if key in known or key in queued:
+            continue
+        queued.add(key)
+        lines.append(encode_line(prompt))
+    if lines:
+        _append_bytes(PARALLEL_INDEX, lines)
+    gk.write_bytes_atomic(SCAN_WATERMARK_FILE, str(scan_started).encode("ascii"))
+    return len(lines)
+
+
+def scan_new_sessions(full: bool = False) -> int:
+    """Queue the prompts of every transcript not yet indexed, then merge them into history.jsonl.
+
+    Returns 0 on success, and also when the lock is busy (one line is printed, nothing is written).
+    """
+    lock = gk.lock_wait(LOCK_NAME, timeout=LOCK_TIMEOUT)
+    if lock is None:
+        print(f"[session-index] scan: lock '{LOCK_NAME}' is held by another process; nothing written")
+        return 0
+    try:
+        queued = _scan_locked(full)
+    except OSError as e:
+        print(f"[session-index] scan: {e}; the watermark was not moved")
+        return 1
+    finally:
+        lock.release()                # merge_history takes this lock too, and FileLock is not reentrant
+    result = merge_history(min_interval_seconds=DEFAULT_MIN_INTERVAL)
+    print(f"[session-index] scan: {queued} new prompt(s) queued; merge {result.status} ({result.added} added)")
+    return 0
 
 
 # --- command line -------------------------------------------------------------
@@ -463,7 +581,9 @@ def main(argv=None) -> int:
         result = merge_history(min_interval_seconds=0)
         print(f"[session-index] merge {result.status}: {result.added} added. {result.detail}")
         return 0
-    print(f"Usage: {Path(sys.argv[0]).name} [register|merge]")
+    if mode == "scan" and all(a == "--full" for a in args[1:]):
+        return scan_new_sessions(full="--full" in args[1:])
+    print(f"Usage: {Path(sys.argv[0]).name} [register|merge|scan [--full]]")
     return 2
 
 
