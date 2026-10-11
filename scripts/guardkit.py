@@ -123,6 +123,58 @@ def read_raw_lines(path: Path) -> list:
 TAKEOVER_STALE = 30.0   # seconds after which a takeover marker may be removed (see FileLock)
 
 
+def pid_alive(pid: int):
+    """True when a process with this pid is running, False when it has exited or never existed, and
+    None when that cannot be told. On Windows os.kill(pid, 0) is unsafe (signal 0 is CTRL_C_EVENT), so
+    the Win32 process handle is checked. A process that exists but cannot be opened counts as running."""
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        k32.GetExitCodeProcess.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        k32.CloseHandle.restype = wintypes.BOOL
+        handle = k32.OpenProcess(0x1000, False, pid)    # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            err = ctypes.get_last_error()
+            if err == 87:                               # ERROR_INVALID_PARAMETER: no such pid
+                return False
+            if err == 5:                                # ERROR_ACCESS_DENIED: it exists
+                return True
+            return None
+        try:
+            code = wintypes.DWORD()
+            if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return None
+            return code.value == 259                    # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+def _lock_holder_dead(path: Path) -> bool:
+    """True only when the lock file names a pid and that process has exited. Anything unreadable is not dead."""
+    try:
+        first = path.read_bytes().split(maxsplit=1)
+        pid = int(first[0]) if first else 0
+    except (OSError, ValueError):
+        return False
+    return pid_alive(pid) is False
+
+
 class FileLock:
     """Cross-process lock using O_EXCL. A lock older than `stale` seconds is treated as abandoned.
 
@@ -130,6 +182,10 @@ class FileLock:
     lock, the takeover marker `<name>.lock.takeover`, which only one process can create at a time.
     The marker holder checks the lock's age again before it removes the lock, so it never removes a
     fresh lock that someone else has just created. release() removes the lock only if its pid is ours.
+
+    reclaim_dead (PR-37, off by default): a lock whose recorded pid has exited is abandoned at once,
+    without waiting for `stale`. The same takeover marker and re-check apply. A pid that cannot be read
+    or checked is not dead, so the `stale` rule still decides. A live holder is never reclaimed.
 
     A PermissionError from the O_EXCL create (step 1) or from the takeover marker create (step 3) is
     treated as busy, not raised. This is a deliberate fail-safe. On Windows, a file that was just
@@ -139,14 +195,22 @@ class FileLock:
 
     Residual risk: a process that holds the takeover marker and is suspended for more than
     TAKEOVER_STALE seconds can have its marker removed by another process, which may then take the
-    lock over. This is accepted for now.
+    lock over. This is accepted for now. A marker left by a killed process still blocks takeovers
+    for up to TAKEOVER_STALE seconds.
     """
 
-    def __init__(self, name: str, stale: float = 1800.0):
+    def __init__(self, name: str, stale: float = 1800.0, reclaim_dead: bool = False):
         self.path = STATE_DIR / "locks" / f"{name}.lock"
         self.takeover = STATE_DIR / "locks" / f"{name}.lock.takeover"
         self.stale = stale
+        self.reclaim_dead = reclaim_dead
         self.held = False
+
+    def _abandoned(self, age: float) -> bool:
+        """May the lock file be removed? Yes when it is older than `stale`, or when reclaim_dead is set and its holder has exited."""
+        if age >= self.stale:
+            return True
+        return self.reclaim_dead and _lock_holder_dead(self.path)
 
     def acquire(self) -> bool:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -177,10 +241,10 @@ class FileLock:
                 continue                          # removed since the failed create
             except OSError:
                 return False
-            if age < self.stale:
+            if not self._abandoned(age):
                 return False
 
-            # 3. The lock is stale. Replace it only while holding the takeover marker.
+            # 3. The lock is stale (or its holder is dead, with reclaim_dead). Replace it only while holding the marker.
             try:
                 mfd = os.open(str(self.takeover), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             except (FileExistsError, PermissionError):   # PermissionError: see step 1
@@ -203,7 +267,7 @@ class FileLock:
                     age = time.time() - os.stat(self.path).st_mtime
                 except FileNotFoundError:
                     age = None                    # already gone
-                if age is not None and age >= self.stale:
+                if age is not None and self._abandoned(age):
                     os.unlink(self.path)
             except FileNotFoundError:
                 pass                              # removed between the stat and the unlink
@@ -227,9 +291,10 @@ class FileLock:
         _unlink_quiet(self.path)
 
 
-def lock_wait(name: str, timeout: float = 30.0):
-    """Acquire a FileLock, waiting up to `timeout` seconds. Returns the lock, or None."""
-    lock = FileLock(name)
+def lock_wait(name: str, timeout: float = 30.0, reclaim_dead: bool = False):
+    """Acquire a FileLock, waiting up to `timeout` seconds. Returns the lock, or None.
+    reclaim_dead: take at once a lock whose holder has exited (see FileLock)."""
+    lock = FileLock(name, reclaim_dead=reclaim_dead)
     end = time.time() + timeout
     while True:
         if lock.acquire():
