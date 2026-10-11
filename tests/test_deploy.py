@@ -19,7 +19,7 @@ def check(name, ok, extra=""):
     print(("PASS " if ok else "FAIL ") + name + (f"  {extra}" if extra else ""))
 
 FIX = Path(tempfile.mkdtemp(prefix="deploy_fix_", dir=_HOME))
-NAMES = ["guardkit.py", "api_repair_v2.py"]
+NAMES = ["guardkit.py", "api_repair_v2.py", "usage_db_v2.py"]  # usage_db_v2.py (PR-29): the fixture copies its source, which the allowlist now needs
 
 def make_repo(label):
     root = FIX / label
@@ -46,6 +46,23 @@ def status_of(out, name):
 
 def sha(p):
     return hashlib.sha256(p.read_bytes()).hexdigest()
+
+# 0. The allowlist (PR-29). Runs first, so these report even if a later check fails. The tool's own ALLOWLIST is read from its file. Nothing is run or copied here.
+import importlib.util
+_spec = importlib.util.spec_from_file_location("deploy_under_test", REPO / "tools" / "deploy.py")
+deploy_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(deploy_mod)
+check("allowlist is exactly the three names, in order",
+      deploy_mod.ALLOWLIST == ["guardkit.py", "api_repair_v2.py", "usage_db_v2.py"],
+      str(deploy_mod.ALLOWLIST))
+
+# An empty scratch target: a dry run lists usage_db_v2.py as new and exits 0.
+AD = FIX / "allow_dry"
+(AD / "session-tools").mkdir(parents=True)
+rc, out = deploy(make_repo("repo_allow_dry"), "--target", AD / "session-tools", "--backup-root", AD / "backups")
+check("dry run on an empty target lists usage_db_v2.py as new and exits 0",
+      rc == 0 and status_of(out, "usage_db_v2.py") == "new",
+      f"rc={rc} status={status_of(out, 'usage_db_v2.py')}")
 
 root = make_repo("repo")
 src = root / "scripts"
