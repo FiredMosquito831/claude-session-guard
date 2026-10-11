@@ -301,9 +301,8 @@ def iter_live_transcripts():
     """(relative_path, absolute_path) for every transcript under projects/, subagents included."""
     if not PROJECTS_DIR.exists():
         return
-    for jsonl_file in PROJECTS_DIR.rglob("*.jsonl"):
-        if jsonl_file.is_file() and "acompact" not in str(jsonl_file):
-            yield jsonl_file.relative_to(PROJECTS_DIR), jsonl_file
+    for rel, jsonl_file, *_ in guardkit.transcript_files(PROJECTS_DIR, skip_unstattable=True, ignore_case=True, files_only=True):
+        yield Path(rel), jsonl_file
 
 
 def deliberately_removed_keys() -> set:
