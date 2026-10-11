@@ -18,6 +18,7 @@ This module decides nothing about what is repaired or archived. It provides:
 import hashlib
 import json
 import os
+import stat
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -238,10 +239,16 @@ def lock_wait(name: str, timeout: float = 30.0):
         time.sleep(0.2)
 
 
-def transcript_files(root: Path = PROJECTS_DIR, top_only: bool = False):
+def transcript_files(root: Path = PROJECTS_DIR, top_only: bool = False, *,
+                     skip_acompact: bool = True, skip_unstattable: bool = False,
+                     ignore_case: bool = False, files_only: bool = False):
     """Yield (rel_posix, path, size, mtime_ns, mtime_s) for each transcript under root, in one pass.
 
     top_only=True yields only <project>/<session>.jsonl and skips subagent and workflow transcripts.
+    skip_acompact=True (default) skips compaction files; False keeps them. Default is today's behaviour.
+    skip_unstattable=False (default) lets an OSError from stat propagate; True skips that entry, as for a broken link.
+    ignore_case=False (default) matches ".jsonl" case-sensitively; True matches it as the platform does (case-insensitive on Windows).
+    files_only=False (default) yields any entry whose stat succeeds; True yields only regular files, as Path.is_file().
     """
     stack = [(str(root), 0)]
     while stack:
@@ -256,11 +263,19 @@ def transcript_files(root: Path = PROJECTS_DIR, top_only: bool = False):
                     if not (top_only and depth >= 1):
                         stack.append((e.path, depth + 1))
                     continue
-                if not e.name.endswith(".jsonl") or "acompact" in e.path:
+                key = os.path.normcase(e.name) if ignore_case else e.name
+                if not key.endswith(".jsonl") or (skip_acompact and "acompact" in e.path):
                     continue
                 if top_only and depth != 1:
                     continue
-                st = e.stat()
+                try:
+                    st = e.stat()
+                except OSError:
+                    if skip_unstattable:
+                        continue
+                    raise
+                if files_only and not stat.S_ISREG(st.st_mode):
+                    continue
                 p = Path(e.path)
                 yield p.relative_to(root).as_posix(), p, st.st_size, st.st_mtime_ns, st.st_mtime
 
@@ -336,7 +351,7 @@ def session_transcripts(transcript: Path) -> list:
     files = [transcript]
     sub = transcript.with_suffix("") / "subagents"
     if sub.is_dir():
-        files.extend(p for p in sub.rglob("*.jsonl") if p.is_file() and "acompact" not in str(p))
+        files.extend(p for _rel, p, *_ in transcript_files(sub, skip_unstattable=True, ignore_case=True, files_only=True))
     return files
 
 
