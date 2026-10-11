@@ -19,7 +19,7 @@ def check(name, ok, extra=""):
     print(("PASS " if ok else "FAIL ") + name + (f"  {extra}" if extra else ""))
 
 FIX = Path(tempfile.mkdtemp(prefix="deploy_fix_", dir=_HOME))
-NAMES = ["guardkit.py", "api_repair_v2.py", "usage_db_v2.py"]  # usage_db_v2.py (PR-29): the fixture copies its source, which the allowlist now needs
+NAMES = ["guardkit.py", "api_repair_v2.py", "usage_db_v2.py", "session_archive_v2.py", "jsonl_repair_v2.py", "session_indexer_v2.py"]  # PR-29, PR-30: the fixture copies every allowlisted script from the repo's scripts folder, which the allowlist needs
 
 def make_repo(label):
     root = FIX / label
@@ -52,8 +52,8 @@ import importlib.util
 _spec = importlib.util.spec_from_file_location("deploy_under_test", REPO / "tools" / "deploy.py")
 deploy_mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(deploy_mod)
-check("allowlist is exactly the three names, in order",
-      deploy_mod.ALLOWLIST == ["guardkit.py", "api_repair_v2.py", "usage_db_v2.py"],
+check("allowlist is exactly the six names, in order",
+      deploy_mod.ALLOWLIST == ["guardkit.py", "api_repair_v2.py", "usage_db_v2.py", "session_archive_v2.py", "jsonl_repair_v2.py", "session_indexer_v2.py"],
       str(deploy_mod.ALLOWLIST))
 
 # An empty scratch target: a dry run lists usage_db_v2.py as new and exits 0.
@@ -63,6 +63,10 @@ rc, out = deploy(make_repo("repo_allow_dry"), "--target", AD / "session-tools", 
 check("dry run on an empty target lists usage_db_v2.py as new and exits 0",
       rc == 0 and status_of(out, "usage_db_v2.py") == "new",
       f"rc={rc} status={status_of(out, 'usage_db_v2.py')}")
+NEW3 = ["session_archive_v2.py", "jsonl_repair_v2.py", "session_indexer_v2.py"]
+check("dry run on an empty target lists the three new v2 scripts as new and exits 0",
+      rc == 0 and all(status_of(out, n) == "new" for n in NEW3),
+      f"rc={rc} {[status_of(out, n) for n in NEW3]}")
 
 root = make_repo("repo")
 src = root / "scripts"
